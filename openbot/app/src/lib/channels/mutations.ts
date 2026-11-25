@@ -1,0 +1,234 @@
+import {
+  type InfiniteData,
+  mutationOptions,
+  type QueryClient,
+} from "@tanstack/react-query";
+import { agentKeys } from "@/lib/agents/queries";
+import {
+  createConversation,
+  deleteConversation,
+  markConversationRead,
+  recordConversationActivity,
+  signalConversationBusy,
+  updateConversation,
+} from "@/lib/api/generated/conversations/conversations";
+import { idempotencyKey, organizationId } from "@/lib/api/request";
+import { botLifecycleKeys } from "@/lib/bot-lifecycle/queries";
+import { settingsKeys } from "@/lib/settings/queries";
+import {
+  type AgentChannel,
+  type ChannelPage,
+  channelKeys,
+  channelOf,
+} from "./queries";
+
+/** A key for one write, so a retry of it is recognised as the same write. */
+const once = () => ({ "Idempotency-Key": idempotencyKey() });
+
+/**
+ * Start a new channel with one or more coworkers.
+ *
+ * Deliberately not idempotent: every call creates a channel with its own thread.
+ */
+export function createChannelMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: async (agentIds: string[]): Promise<AgentChannel> => {
+      const made = await createConversation(
+        organizationId(),
+        { botIds: agentIds },
+        once(),
+        { fallback: "Couldn't start a conversation." },
+      );
+      return channelOf(made.conversation);
+    },
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: channelKeys.all }),
+        // Creating the first starter-Bot conversation claims this person's tour on the server.
+        queryClient.invalidateQueries({
+          queryKey: [...settingsKeys.all, "preferences"],
+        }),
+      ]),
+  });
+}
+
+/**
+ * Report the last thing said in a channel.
+ *
+ * The client that ran the agent already has the message before platform replay can return it; the
+ * runtime exposes no run-completion hook and its run endpoint returns before the reply exists.
+ *
+ * Fire-and-forget on purpose: a failed preview update is a stale roster line, not a lost message.
+ */
+export function recordChannelActivityMutationOptions() {
+  return mutationOptions({
+    mutationFn: async (variables: {
+      channelId: string;
+      text: string;
+      agentId: string | null;
+      at: string;
+    }) => {
+      /* Still fire-and-forget: `tryClient` does not throw, and the result is not read. */
+      // Best effort: the list catches up on its next read if this one is lost.
+      await recordConversationActivity(
+        organizationId(),
+        variables.channelId,
+        { botId: variables.agentId, at: variables.at, text: variables.text },
+        once(),
+      ).catch(() => undefined);
+    },
+  });
+}
+
+/**
+ * Tell the roster this channel is (or is no longer) running a turn.
+ *
+ * Fire-and-forget, like recorded activity: a working indicator that fails to appear or to clear is
+ * worth nothing next to the run itself, and a person is never shown an error for it. The server
+ * broadcasts it to the channel's members, so the row shows a working dot even on a tab that has
+ * navigated elsewhere.
+ *
+ * A plain function, not a mutation handle: the turn it reports on outlives the screen that started
+ * it, and `mutate` on an unmounted component is a no-op.
+ */
+export async function setChannelBusy(variables: {
+  channelId: string;
+  busy: boolean;
+}) {
+  // Best effort: a lost signal is corrected by the next one.
+  await signalConversationBusy(
+    organizationId(),
+    variables.channelId,
+    { busy: variables.busy },
+    once(),
+  ).catch(() => undefined);
+}
+
+/** Pin or unpin a channel for this member. A marker, not a reorder, so no optimistic sort. */
+export function setChannelPinnedMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: async (variables: { channelId: string; pinned: boolean }) => {
+      await updateConversation(
+        organizationId(),
+        variables.channelId,
+        { pinned: variables.pinned },
+        once(),
+        { fallback: "Couldn't pin this conversation." },
+      );
+    },
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: channelKeys.all }),
+  });
+}
+
+/**
+ * Name a conversation, or clear its name with an empty one so it goes back to its summary.
+ *
+ * Only the person who started it may; the server refuses anybody else, and the roster's `canRename`
+ * is that same answer read ahead of time. The name is the conversation's, for every member.
+ */
+export function renameChannelMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: async (variables: { channelId: string; title: string }) => {
+      await updateConversation(
+        organizationId(),
+        variables.channelId,
+        { title: variables.title.trim() || null },
+        once(),
+        { fallback: "Couldn't rename this conversation." },
+      );
+    },
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: channelKeys.list() }),
+        // A search found it by its old name, or would find it by its new one.
+        queryClient.invalidateQueries({ queryKey: channelKeys.searches() }),
+        queryClient.invalidateQueries({ queryKey: channelKeys.byBots() }),
+      ]),
+  });
+}
+
+/**
+ * Stamp a channel read for this member, patching the cache before the wire answers.
+ *
+ * Patched in onMutate rather than refetched on success: the dot must clear the instant the channel
+ * opens, not a round-trip later. No rollback on failure and no roster invalidation — a mark-read
+ * that did not land is a dot that returns on the next refetch, which is the truth reasserting
+ * itself, and a roster refetch here would race the socket's own patches for nothing. The Bots
+ * badge counts unread on the server, so once the mark lands its count is asked for again rather
+ * than left lit until its next poll.
+ */
+export function markChannelReadMutationOptions(queryClient: QueryClient) {
+  return mutationOptions({
+    mutationFn: async (channelId: string) => {
+      await markConversationRead(organizationId(), channelId, once(), {
+        fallback: "Couldn't mark this conversation as read.",
+      });
+    },
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: botLifecycleKeys.attention }),
+    onMutate: (channelId) => {
+      const now = new Date().toISOString();
+      const markRead = (data: InfiniteData<ChannelPage> | undefined) =>
+        data && {
+          ...data,
+          pages: data.pages.map((page) => ({
+            ...page,
+            channels: page.channels.map((row) =>
+              row.id === channelId
+                ? {
+                    ...row,
+                    /*
+                     * The later of now and the row's own lastMessageAt: lastMessageAt comes from
+                     * another clock, and a marker stamped "now" by a clock running behind it
+                     * would leave the row still reading as unseen — and the dot still lit.
+                     */
+                    lastReadAt:
+                      row.lastMessageAt && row.lastMessageAt > now
+                        ? row.lastMessageAt
+                        : now,
+                  }
+                : row,
+            ),
+          })),
+        };
+      queryClient.setQueryData(channelKeys.list(), markRead);
+      // The same row in any search that holds it, so the dot does not come back there either.
+      queryClient.setQueriesData(
+        { queryKey: channelKeys.searches() },
+        markRead,
+      );
+      // And under each of its Bots in the Bots panel.
+      queryClient.setQueriesData({ queryKey: channelKeys.byBots() }, markRead);
+    },
+  });
+}
+
+/** Soft-delete a channel for everyone in it. The server keeps the transcript; the roster forgets. */
+export function deleteChannelMutationOptions(
+  queryClient: QueryClient,
+  discardFailedStart = false,
+) {
+  return mutationOptions({
+    mutationFn: async (channelId: string) => {
+      await deleteConversation(
+        organizationId(),
+        channelId,
+        once(),
+        discardFailedStart ? { discardFailedStart: true } : undefined,
+        { fallback: "Couldn't delete this conversation." },
+      );
+    },
+    // The roster, its searches and the Bots panel's lists only. The open channel's detail query would refetch into the
+    // fresh 404 and flash an error before the navigate-home lands; left alone, it keeps its cache
+    // and the navigation happens with nothing to complain about. The Bots list too: its
+    // `lastConversationAt` orders the Bots panel and may have been this conversation's.
+    onSuccess: () =>
+      Promise.all([
+        queryClient.invalidateQueries({ queryKey: channelKeys.list() }),
+        queryClient.invalidateQueries({ queryKey: channelKeys.searches() }),
+        queryClient.invalidateQueries({ queryKey: channelKeys.byBots() }),
+        queryClient.invalidateQueries({ queryKey: agentKeys.lists() }),
+      ]),
+  });
+}

@@ -1,0 +1,765 @@
+import {
+  type Query,
+  type QueryClient,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { useRouter } from "@tanstack/react-router";
+import { useEffect } from "react";
+import { HELD_OUT_NOW, holdOut, SSO_REQUIRED_CLOSE } from "@/lib/auth/held-out";
+import { nudgeMoment } from "@/lib/notices";
+import {
+  isBotReply,
+  noticeChannelEvent,
+} from "@/lib/notifications/reply-notice";
+import { currentOrganizationId } from "@/lib/organizations/current";
+import { apiSocketPath, socketUrl as buildSocketUrl } from "@/lib/socket-url";
+import { type BotTask, taskKeys } from "@/lib/tasks/queries";
+import {
+  type AgentChannel,
+  type ChannelPage,
+  type ChannelSummary,
+  type ChannelWork,
+  channelKeys,
+} from "./queries";
+import { type BotLine, botSaidOffTheList } from "./said-off-the-list";
+
+/**
+ * Keep the roster live.
+ *
+ * The query remains the source of truth; socket events only patch its cache. Reconnects refetch the
+ * list to recover events missed while disconnected.
+ *
+ * Two connections can drop and only one is this one. `onopen` covers this socket. The other is the
+ * server's subscription to Postgres, which stays invisible here — so the server sends a resync when
+ * it comes back, answered with the same refetch.
+ */
+
+/** The server saying it may have missed announcements, so the roster we hold may be wrong. */
+export type ChannelResyncEvent = { resync: true };
+
+/** What arrives on the socket. `resync` is the discriminant; an activity event never carries it. */
+export type ChannelSocketMessage = ChannelActivityEvent | ChannelResyncEvent;
+
+export function isResync(message: unknown): message is ChannelResyncEvent {
+  return (
+    typeof message === "object" &&
+    message !== null &&
+    (message as ChannelResyncEvent).resync === true
+  );
+}
+
+/**
+ * Whether a parsed socket payload has the shape of anything this roster handles.
+ *
+ * The `try` around `JSON.parse` is not enough: `JSON.parse("null")` succeeds with
+ * `null`, and `JSON.parse("5")` succeeds with `5`, and both used to reach `isResync`
+ * — `null.resync` throwing a `TypeError` inside `onmessage` for the first, and a
+ * spurious roster-wide refetch for the second when the channel id came back
+ * `undefined`. Binary frames arrive as `Blob` rather than text and never parse.
+ */
+export function isChannelSocketMessage(
+  value: unknown,
+): value is ChannelSocketMessage {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether an activity event is about the organization the person is working in.
+ *
+ * A person can be in several organizations, and the socket is theirs, not one organization's. An event that names
+ * another organization (`organizationId`) is about a conversation this screen does not hold, and patching it in would
+ * put that organization's preview in this one's sidebar, or refetch for a row that will never be here. An event that
+ * names none, from a server older than this, is taken as it always was.
+ */
+function inOrganization(
+  activity: { organizationId?: unknown },
+  organization: string | undefined,
+): boolean {
+  return (
+    typeof activity.organizationId !== "string" ||
+    organization === undefined ||
+    activity.organizationId === organization
+  );
+}
+
+/**
+ * Parse one socket frame into something the roster can act on, or `null` to drop it.
+ *
+ * Pure and exported so the drop rules are provable without a socket: unparseable
+ * text, non-object JSON (`null`, numbers, strings, arrays), activity events with
+ * no string channel id, and activity events about another organization than
+ * `organization` are all ignored rather than crashing or refetching the roster.
+ */
+export function parseChannelSocketMessage(
+  data: unknown,
+  organization: string | undefined = currentOrganizationId(),
+): ChannelSocketMessage | null {
+  if (typeof data !== "string") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (!isChannelSocketMessage(parsed)) return null;
+  if (isResync(parsed)) return parsed;
+  if (typeof parsed.channelId !== "string") return null;
+  if (!inOrganization(parsed, organization)) return null;
+  return parsed;
+}
+
+export type ChannelActivityEvent = {
+  channelId: string;
+  /**
+   * The organization the conversation is in. Absent from a server older than this, and then the event is taken
+   * whatever organization the person is working in (`inOrganization`).
+   */
+  organizationId?: string;
+  lastMessage: string | null;
+  lastMessageAt: string | null;
+  lastMessageAgentId: string | null;
+  /**
+   * A Bot's reply, its first line as plain text, for the notice a reply raises while OpenBot is out
+   * of sight. `lastMessage` runs every line into one. Only on a Bot's message, and absent from a
+   * server older than this.
+   */
+  firstLine?: string;
+  /**
+   * What the channel is called now: a newly written summary, or a rename. Null when a cleared name
+   * leaves it with no summary yet. Absent on an ordinary activity event.
+   */
+  summary?: string | null;
+  /** A person's first words, newly written: the row's name until its summary. Absent otherwise. */
+  opening?: string;
+  /** The channel is gone from every member's roster. Absent on an ordinary activity event. */
+  deleted?: true;
+  /**
+   * This member's pin, changed. Absent on an ordinary activity event.
+   *
+   * The server scopes a pin to the member who made it, so one arriving here is the reader's own,
+   * made in another tab or on another replica.
+   */
+  pinned?: boolean;
+  /**
+   * A turn started or ended in this channel. Absent on an ordinary activity event.
+   *
+   * Carries no message: it patches only the row's `busy` flag, so the roster can show a working
+   * indicator without disturbing the preview or the order.
+   */
+  busy?: boolean;
+  /**
+   * Everything the channel is waiting on now, replacing what the row held. Absent on an ordinary
+   * activity event. Rides on every busy event, and alone on the one the server sends when a hop
+   * settles without a turn starting or ending.
+   */
+  work?: ChannelWork[];
+  /**
+   * When the server read `work`, as fixed-width UTC that compares as a string. Two events can
+   * arrive in the other order from the one they were read in, so a list older than the one already
+   * held is ignored. See `newerWork`.
+   */
+  workAt?: string;
+};
+
+/** The infinite query's cache, which holds pages rather than one array. */
+type ChannelCache = { pages: ChannelPage[]; pageParams: unknown[] };
+
+/**
+ * Apply one event to the cached pages.
+ *
+ * Pure, and exported, because the patching rules are the whole of what a socket event does to the
+ * screen and they should be provable without a socket. Returns the cache it was given when nothing
+ * changed, so React re-renders nothing, and `"unknown"` when the event names a channel no page
+ * holds — which the caller answers with a refetch rather than a patch.
+ */
+export function applyChannelEvent(
+  data: ChannelCache,
+  activity: ChannelActivityEvent,
+): ChannelCache | "unknown" {
+  const holdingPage = data.pages.findIndex((page) =>
+    page.channels.some((channel) => channel.id === activity.channelId),
+  );
+
+  // Must run before the patch below, which spreads the event onto the existing row — reaching that
+  // first would stamp `deleted: true` on the row instead of removing it. An unknown channel here is
+  // already gone from this cache, so there is nothing to patch or invalidate for, unlike the
+  // "unknown channel" case below for an ordinary event.
+  if (activity.deleted) {
+    if (holdingPage === -1) return data;
+    const page = data.pages[holdingPage] as ChannelPage;
+    const pages = data.pages.slice();
+    pages[holdingPage] = {
+      ...page,
+      channels: page.channels.filter(
+        (channel) => channel.id !== activity.channelId,
+      ),
+    };
+    return { ...data, pages };
+  }
+
+  // An unknown channel id means the roster is stale; refetch rather than patch.
+  if (holdingPage === -1) return "unknown";
+
+  const page = data.pages[holdingPage] as ChannelPage;
+  const index = page.channels.findIndex(
+    (channel) => channel.id === activity.channelId,
+  );
+  const previous = page.channels[index];
+  if (!previous) return data;
+
+  /* One field, and no re-sort: naming a conversation is not something anybody said in it. */
+  if (activity.summary !== undefined) {
+    if (previous.summary === activity.summary) return data;
+    const channels = page.channels.slice();
+    channels[index] = { ...previous, summary: activity.summary };
+    const pages = data.pages.slice();
+    pages[holdingPage] = { ...page, channels };
+    return { ...data, pages };
+  }
+
+  /*
+   * An opening patches the one field too, for the same reason. It can come from a person's message
+   * the server found stale as the last message, so the spread below would carry nulls onto the row.
+   */
+  if (activity.opening !== undefined) {
+    if (previous.opening === activity.opening) return data;
+    const channels = page.channels.slice();
+    channels[index] = { ...previous, opening: activity.opening };
+    const pages = data.pages.slice();
+    pages[holdingPage] = { ...page, channels };
+    return { ...data, pages };
+  }
+
+  /*
+   * A pin patches the one field it is about.
+   *
+   * The spread below would carry this event's null message onto the row and wipe the preview the
+   * roster renders. No re-sort either: a pin is not activity, and pinned rows are lifted at render
+   * time by `pinnedFirst`, not by the order they sit in here.
+   */
+  if (activity.pinned !== undefined) {
+    if (previous.pinned === activity.pinned) return data;
+    const channels = page.channels.slice();
+    channels[index] = { ...previous, pinned: activity.pinned };
+    const pages = data.pages.slice();
+    pages[holdingPage] = { ...page, channels };
+    return { ...data, pages };
+  }
+
+  /*
+   * A busy signal patches the one field it is about, and never re-sorts.
+   *
+   * The spread below would carry this event's null message onto the row and wipe the preview. Busy
+   * is also not activity — a channel does not jump to the top of the roster because a turn started
+   * in it — so the order is left exactly as it was.
+   */
+  if (activity.busy !== undefined || activity.work !== undefined) {
+    const busy = activity.busy ?? previous.busy;
+    const fresh = newerWork(previous, activity);
+    const work = fresh ? activity.work : previous.work;
+    if (
+      (previous.busy ?? false) === (busy ?? false) &&
+      sameWork(previous.work, work)
+    )
+      return data;
+    const channels = page.channels.slice();
+    channels[index] = {
+      ...previous,
+      ...(busy === undefined ? {} : { busy }),
+      ...(work === undefined ? {} : { work }),
+      ...(fresh && activity.workAt ? { workAt: activity.workAt } : {}),
+    };
+    const pages = data.pages.slice();
+    pages[holdingPage] = { ...page, channels };
+    return { ...data, pages };
+  }
+
+  // Preserve object identity for unchanged rows so memoized rows do not re-render.
+  const next = page.channels.slice();
+  next[index] = { ...previous, ...activity };
+  next.sort(byRecency);
+
+  // An event that changes nothing visible, a duplicate, or a report the server ignored as stale,
+  // returns the original object, so React re-renders nothing at all.
+  if (next.every((channel, at) => channel === page.channels[at])) return data;
+
+  const pages = data.pages.slice();
+  pages[holdingPage] = { ...page, channels: next };
+  return { ...data, pages };
+}
+
+/**
+ * The same list, entry for entry. Compared rather than replaced so an event that changes nothing
+ * leaves the cache alone and the transcript does not re-render to draw the same rows.
+ */
+function sameWork(
+  left: readonly ChannelWork[] | undefined,
+  right: readonly ChannelWork[] | undefined,
+): boolean {
+  const a = left ?? [];
+  const b = right ?? [];
+  return (
+    a.length === b.length &&
+    a.every(
+      (entry, at) =>
+        entry.key === b[at]?.key &&
+        entry.since === b[at]?.since &&
+        entry.botName === b[at]?.botName,
+    )
+  );
+}
+
+/**
+ * Whether this event's work list should replace the one held.
+ *
+ * Only when it carries one, and was not read before the one already held. A list from a fetch has
+ * no stamp and gives way to any event; an event without a stamp, from an older server, always
+ * wins, as every event did before stamps.
+ */
+function newerWork(
+  held: { workAt?: string },
+  activity: ChannelActivityEvent,
+): boolean {
+  if (activity.work === undefined) return false;
+  if (!held.workAt || !activity.workAt) return true;
+  return activity.workAt >= held.workAt;
+}
+
+/**
+ * Apply one event's work list to the open conversation's own read.
+ *
+ * The conversation screen reads the channel by id rather than from the roster: the roster is paged,
+ * and the conversation somebody has open need not be on a page they have loaded. So the list is
+ * patched there too, and only there when the event carries one.
+ */
+export function applyChannelWork(
+  channel: AgentChannel | undefined,
+  activity: ChannelActivityEvent,
+): AgentChannel | undefined {
+  if (!channel || !newerWork(channel, activity)) return channel;
+  if (sameWork(channel.work, activity.work)) return channel;
+  return {
+    ...channel,
+    work: activity.work,
+    ...(activity.workAt ? { workAt: activity.workAt } : {}),
+  };
+}
+
+/**
+ * A conversation's work changed, so the tasks it handed out may have too: their cards read again.
+ *
+ * A card reads its task every few seconds while the task works or waits on the person, and leaves
+ * it alone once it is done or couldn't finish. A task that carries on after that (the person replied
+ * in its thread, or pressed Try again) would stay Done on its card until a reload. The server says a
+ * conversation's work changed whenever one of its tasks changes state, with the list's stamp
+ * (`workAt`), and every card on screen reads its task again then. Cards not on screen are only
+ * marked stale, and read when they are next drawn.
+ */
+export function refreshTaskCards(
+  queryClient: QueryClient,
+  activity: ChannelActivityEvent,
+): void {
+  if (!activity.workAt) return;
+  readTasksOfConversation(queryClient, activity.channelId);
+}
+
+/** Reads waiting on a read under way, to read once more when it lands. */
+const readAgainAfter = new WeakSet<Query>();
+
+/**
+ * Read a query once more when the read under way lands, since that read may have begun before the
+ * change being answered.
+ *
+ * The read under way is let finish rather than cancelled: cancelling and starting again under a
+ * stream of events starves it (see `readTasksOfConversation`). However many changes arrive while it
+ * runs, it is read once more, once.
+ */
+function readAgainWhenLanded(queryClient: QueryClient, query: Query): void {
+  if (readAgainAfter.has(query)) return;
+  readAgainAfter.add(query);
+  const cache = queryClient.getQueryCache();
+  const stop = cache.subscribe((event) => {
+    if (event.query !== query || query.state.fetchStatus === "fetching") return;
+    stop();
+    readAgainAfter.delete(query);
+    void queryClient.invalidateQueries(
+      { queryKey: query.queryKey, exact: true },
+      { cancelRefetch: false },
+    );
+  });
+}
+
+/**
+ * THE CARDS OF ONE CONVERSATION READ THEIR TASKS AGAIN, AND A READ UNDER WAY IS NEVER THROWN AWAY.
+ *
+ * Every card on screen used to read its task again on any conversation's work changing, and each
+ * read cancelled the one before it. Found under load, five conversations working at once: the
+ * person's events came every 100 to 300 ms, a task's read took longer than that, so each card's
+ * read was cancelled and started again until the events paused. A card left open read Done for 12 s
+ * after its task needed the person, with no Stop on it, and every page's reads kept the server busy
+ * enough that Stop itself answered in seconds. Now only the cards of the conversation the event is
+ * about read again (the one that asked for a task, or the task's own), and a read already under way
+ * is let finish, then read once more, since it may have begun before the change.
+ */
+function readTasksOfConversation(queryClient: QueryClient, channelId: string) {
+  const cache = queryClient.getQueryCache();
+  for (const query of cache.findAll({ queryKey: taskKeys.ones })) {
+    const card = query.state.data as BotTask | undefined;
+    // A task with no conversation that asked for it (a check-in's) is read on any change, as before.
+    if (
+      card?.originChannelId &&
+      card.originChannelId !== channelId &&
+      card.channelId !== channelId
+    )
+      continue;
+    if (query.state.fetchStatus === "fetching") {
+      readAgainWhenLanded(queryClient, query);
+      continue;
+    }
+    void queryClient.invalidateQueries(
+      { queryKey: query.queryKey, exact: true },
+      { cancelRefetch: false },
+    );
+  }
+}
+
+/**
+ * The Bot's line an event carries, when that is all it is about: null for a person's line, and for
+ * an event about a name, a pin, a deletion or what the conversation waits on, which say nothing new.
+ */
+export function botLineOf(activity: ChannelActivityEvent): BotLine | null {
+  if (
+    activity.lastMessageAgentId === null ||
+    activity.lastMessageAt === null ||
+    activity.lastMessage === null ||
+    activity.summary !== undefined ||
+    activity.opening !== undefined ||
+    activity.pinned !== undefined ||
+    activity.deleted !== undefined ||
+    activity.busy !== undefined ||
+    activity.work !== undefined
+  )
+    return null;
+  return {
+    agentId: activity.lastMessageAgentId,
+    at: activity.lastMessageAt,
+    text: activity.lastMessage,
+  };
+}
+
+/**
+ * Apply one event to the list, and say so where the list cannot.
+ *
+ * The list is paged, so the cache holds pages rather than one array. The channel is patched inside
+ * whichever page holds it and that page is re-sorted. Sorting across pages is deliberately not
+ * attempted: a channel that has just become the most recent belongs at the top of page one, and
+ * moving a row between pages would fight the cursors the next fetch uses. The page it is on stays
+ * correct, and the next refetch puts it in order.
+ *
+ * A conversation no page holds is refetched for, and when the event is a Bot's line the conversation
+ * itself is told (`said-off-the-list.ts`): a task's thread is never on a page, and is read through
+ * this alone.
+ *
+ * A patch made while the list is being read is read for again once that read lands. The read may
+ * have begun before the change, and landing after the patch it would put the old row back. Found
+ * with a subagent and its parent named in the same pass, the subagent first: its conversation was
+ * not on the list, so the list was read again; the parent's name patched its row while that read
+ * was on its way, and the read put back the row with no name. Nothing read the list again, so the
+ * sidebar called the parent by its first message until a reload.
+ */
+export function applyToRoster(
+  queryClient: QueryClient,
+  activity: ChannelActivityEvent,
+): void {
+  let listed = true;
+  queryClient.setQueryData(
+    channelKeys.list(),
+    (data: ChannelCache | undefined) => {
+      if (!data) return data;
+      const patched = applyChannelEvent(data, activity);
+      if (patched !== "unknown") return patched;
+      listed = false;
+      return data;
+    },
+  );
+  if (listed) {
+    const list = queryClient
+      .getQueryCache()
+      .find({ queryKey: channelKeys.list(), exact: true });
+    if (list?.state.fetchStatus === "fetching")
+      readAgainWhenLanded(queryClient, list);
+    return;
+  }
+  // An unknown channel id means the roster is stale; refetch rather than patch.
+  void queryClient.invalidateQueries({ queryKey: channelKeys.list() });
+  const line = botLineOf(activity);
+  if (line) botSaidOffTheList(activity.channelId, line);
+}
+
+/**
+ * Whether an event is something said in a conversation: the one kind that moves a conversation in a
+ * list ordered by recency, so the one kind that can bring it onto a Bot's first page. A name, an
+ * opening, a pin, busy and work patch a row where it is, and a deletion takes it out.
+ */
+function saidSomething(activity: ChannelActivityEvent): boolean {
+  return (
+    activity.deleted === undefined &&
+    activity.summary === undefined &&
+    activity.opening === undefined &&
+    activity.pinned === undefined &&
+    activity.busy === undefined &&
+    activity.work === undefined
+  );
+}
+
+/** Read a query again: now, or once a read already under way lands. Never cancels that read. */
+function readAgain(queryClient: QueryClient, query: Query): void {
+  if (query.state.fetchStatus === "fetching") {
+    readAgainWhenLanded(queryClient, query);
+    return;
+  }
+  void queryClient.invalidateQueries(
+    { queryKey: query.queryKey, exact: true },
+    { cancelRefetch: false },
+  );
+}
+
+/** The Bots in a conversation, as the roster holds it; undefined when the roster does not. */
+function botsInConversation(
+  queryClient: QueryClient,
+  channelId: string,
+): string[] | undefined {
+  return queryClient
+    .getQueryData<ChannelCache>(channelKeys.list())
+    ?.pages.flatMap((page) => page.channels)
+    .find((channel) => channel.id === channelId)?.agentIds;
+}
+
+/**
+ * Apply one event to every Bot's list the Bots panel has open (`channelKeys.byBot`), as
+ * {@link applyToRoster} does to the roster. A list that holds the conversation is patched in place. A
+ * list that does not is read again only for something said in the conversation, and only when its
+ * Bot is in it. Which Bots are in it is the roster's word (the event was just applied to it). When
+ * the roster does not know the conversation either, it is being read again for it, and once that
+ * read lands it says; a conversation it still does not hold, a task's thread, is on no Bot's list.
+ *
+ * Found in review: every busy, work or naming event on a conversation past a Bot's loaded rows read
+ * that Bot's list again, and a task thread's events read every open Bot's list, each read cancelling
+ * the one before (Show more's among them) and none of them ever bringing the row in.
+ */
+export function applyToBotLists(
+  queryClient: QueryClient,
+  activity: ChannelActivityEvent,
+): void {
+  const moves = saidSomething(activity);
+  const missing: { botId: string; query: Query }[] = [];
+  for (const query of queryClient
+    .getQueryCache()
+    .findAll({ queryKey: channelKeys.byBots() })) {
+    const botId = query.queryKey[2];
+    const data = query.state.data as ChannelCache | undefined;
+    if (typeof botId !== "string" || !data) continue;
+    const patched = applyChannelEvent(data, activity);
+    if (patched !== "unknown") {
+      /*
+       * A patch reorders only the page that holds the row. Past a Bot's first page (after Show
+       * more), a conversation with news could not reach the top that way, so the list is read again.
+       */
+      const holding = patched.pages.findIndex((page) =>
+        page.channels.some((channel) => channel.id === activity.channelId),
+      );
+      if (holding > 0 && moves) readAgain(queryClient, query);
+      else if (patched !== data)
+        queryClient.setQueryData(query.queryKey, patched);
+      continue;
+    }
+    if (moves) missing.push({ botId, query });
+  }
+  if (missing.length === 0) return;
+
+  const readFor = (botIds: readonly string[]) => {
+    for (const { botId, query } of missing)
+      if (botIds.includes(botId)) readAgain(queryClient, query);
+  };
+  const known = botsInConversation(queryClient, activity.channelId);
+  if (known) {
+    readFor(known);
+    return;
+  }
+  const roster = queryClient
+    .getQueryCache()
+    .find({ queryKey: channelKeys.list(), exact: true });
+  if (roster?.state.fetchStatus === "fetching") {
+    const stop = queryClient.getQueryCache().subscribe((event) => {
+      if (event.query !== roster || roster.state.fetchStatus === "fetching")
+        return;
+      stop();
+      readFor(botsInConversation(queryClient, activity.channelId) ?? []);
+    });
+    return;
+  }
+  // No roster read to wait on (nothing shows it): the Bot that spoke is in the conversation.
+  if (activity.lastMessageAgentId) readFor([activity.lastMessageAgentId]);
+}
+
+const FIRST_RETRY_MS = 500;
+const MAX_RETRY_MS = 30_000;
+
+function socketUrl() {
+  return buildSocketUrl(apiSocketPath("/conversation-events"));
+}
+
+export function useChannelEvents() {
+  const queryClient = useQueryClient();
+  const router = useRouter();
+
+  useEffect(() => {
+    let socket: WebSocket | undefined;
+    let retryTimer: number | undefined;
+    let retryDelay = FIRST_RETRY_MS;
+    let stopped = false;
+
+    const connect = () => {
+      if (stopped) return;
+      socket = new WebSocket(socketUrl());
+
+      socket.onopen = () => {
+        retryDelay = FIRST_RETRY_MS;
+        // Recover events missed while the socket was disconnected.
+        void queryClient.invalidateQueries({ queryKey: channelKeys.list() });
+        void queryClient.invalidateQueries({ queryKey: channelKeys.details() });
+        void queryClient.invalidateQueries({ queryKey: channelKeys.byBots() });
+      };
+
+      socket.onmessage = (message) => {
+        const parsed = parseChannelSocketMessage(message.data);
+        if (!parsed) return;
+
+        // Refetch rather than patch: there is no delta to apply. Checked before anything reads
+        // `channelId`, because this message has none.
+        if (isResync(parsed)) {
+          void queryClient.invalidateQueries({ queryKey: channelKeys.list() });
+          void queryClient.invalidateQueries({
+            queryKey: channelKeys.details(),
+          });
+          void queryClient.invalidateQueries({
+            queryKey: channelKeys.byBots(),
+          });
+          return;
+        }
+
+        const activity = parsed;
+        // A group conversation's shared transcript moves with the same events; refetch it if open.
+        void queryClient.invalidateQueries({
+          queryKey: ["groups", activity.channelId],
+        });
+
+        applyToRoster(queryClient, activity);
+        applyToBotLists(queryClient, activity);
+
+        // A Bot's reply, while OpenBot is out of sight: the notice, when the person allowed them.
+        noticeChannelEvent(activity, queryClient, (channelId) => {
+          void router.navigate({
+            to: "/channel/$channelId",
+            params: { channelId },
+          });
+        });
+
+        refreshTaskCards(queryClient, activity);
+
+        /*
+         * A turn ended, or a Bot said something: a routine's run or a long task may just have
+         * finished, which is a win a nudge may follow. The preferences are read again a moment
+         * later, once the server has written the run's outcome (`lib/notices.ts`). Nothing is read
+         * where no nudge could come of it.
+         */
+        if (activity.busy === false || isBotReply(activity))
+          nudgeMoment(queryClient, { afterMs: 1500 });
+
+        if (activity.work !== undefined) {
+          queryClient.setQueryData(
+            channelKeys.detail(activity.channelId),
+            (channel: AgentChannel | undefined) =>
+              applyChannelWork(channel, activity),
+          );
+        }
+
+        /*
+         * What a conversation waits on moved with no turn starting or ending: a task it started
+         * reported back, or the person told one something in its thread. Its task cards read
+         * their tasks again, so a card open here says so at once, not on its next slow read.
+         */
+        if (activity.work !== undefined && activity.busy === undefined) {
+          readTasksOfConversation(queryClient, activity.channelId);
+          // The lists (the Bots page, the sidebar's count) finish any read under way first.
+          void queryClient.invalidateQueries(
+            {
+              queryKey: taskKeys.all,
+              predicate: (query) => query.queryKey[1] !== "one",
+            },
+            { cancelRefetch: false },
+          );
+        }
+
+        /*
+         * A tab looking at the channel somebody just deleted in another tab.
+         *
+         * The tab that issued the delete moves itself once the request returns. Every other tab only
+         * ever hears about it here, and dropping the row without moving leaves that tab on a route
+         * whose channel no longer resolves: an error, or an empty conversation, depending on which
+         * query answers first.
+         *
+         * Read off the router at event time rather than through `useParams`, so the effect does not
+         * have to be torn down and reconnected on every navigation just to keep this value fresh.
+         */
+        if (activity.deleted) {
+          const { pathname } = router.state.location;
+          if (
+            pathname === `/channel/${activity.channelId}` ||
+            pathname === `/group/${activity.channelId}`
+          ) {
+            void router.navigate({ to: "/" });
+          }
+        }
+      };
+
+      // WebSocket needs explicit reconnect handling.
+      socket.onclose = (event) => {
+        if (stopped) return;
+        /*
+         * The organization began to hold the person out until they sign in through their company: the server ends the
+         * socket so, and would refuse it again. Not reconnected; the app gives way to the held page at once.
+         */
+        if (event.code === SSO_REQUIRED_CLOSE) {
+          holdOut(HELD_OUT_NOW);
+          return;
+        }
+        retryTimer = window.setTimeout(connect, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, MAX_RETRY_MS);
+      };
+    };
+
+    connect();
+
+    return () => {
+      stopped = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      // Cleared first: the close below must not schedule a reconnect for a screen that is gone.
+      if (socket) socket.onclose = null;
+      socket?.close();
+    };
+  }, [queryClient, router]);
+}
+
+/**
+ * Most recent first, where starting a conversation counts as activity.
+ *
+ * Deliberately the same rule the roster query uses, `coalesce(last_message_at, created_at) desc` in
+ * channels/routes.ts. If these two disagree the list reorders itself the moment an event arrives,
+ * which looks like rows jumping for no reason.
+ */
+function byRecency(left: ChannelSummary, right: ChannelSummary) {
+  const at = (channel: ChannelSummary) =>
+    channel.lastMessageAt ?? channel.createdAt;
+  return at(right).localeCompare(at(left));
+}

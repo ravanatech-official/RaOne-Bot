@@ -1,0 +1,360 @@
+import {
+  type InfiniteData,
+  infiniteQueryOptions,
+  type QueryClient,
+  queryOptions,
+} from "@tanstack/react-query";
+import { everyPage } from "@/lib/api/every-page";
+import {
+  getConversation,
+  listConversations,
+  listRefusedTurns,
+} from "@/lib/api/generated/conversations/conversations";
+import type {
+  RefusedTurn as ApiRefusedTurn,
+  Conversation,
+  ConversationSummary,
+} from "@/lib/api/generated/model";
+import { organizationId } from "@/lib/api/request";
+
+/**
+ * A channel as the browser sees it.
+ *
+ * `threadId` is what makes two channels with the same coworker independent conversations, and
+ * `active` is false once a linked coworker has been deleted: the transcript stays readable, but
+ * nothing more can be said in it.
+ */
+export type AgentChannel = {
+  id: string;
+  name: string;
+  agentIds: string[];
+  threadId: string;
+  active: boolean;
+  /**
+   * ISO-8601 when something was last said here, or null for a conversation nobody has used.
+   *
+   * The conversation screen needs this to tell two silences apart: a new conversation with no
+   * history, and one whose history this deployment cannot reach. See `channel-chat.tsx`.
+   */
+  lastMessageAt: string | null;
+  /**
+   * What this conversation is waiting on right now, oldest first. See `ChannelWork`.
+   *
+   * Read with the channel and replaced whole by every busy event, so a reload shows the same thing
+   * the socket last said. Absent from a server that predates it, which reads as nothing.
+   */
+  work?: ChannelWork[];
+  /**
+   * When the server read `work`, from the socket event that last set it. Absent on a fetched read.
+   * Kept so an older event arriving late does not put back a list that has moved on.
+   */
+  workAt?: string;
+};
+
+/**
+ * Something a conversation is waiting on that nobody's browser is running: a Bot its Bot asked,
+ * answering out of sight, or a routine firing into it.
+ *
+ * The server reads it from the hop queue and the routine runs, so it holds for as long as the work
+ * does, across reloads and replicas. `since` is when it started, for the timer a person watches.
+ */
+export type ChannelWork =
+  | {
+      kind: "handoff";
+      key: string;
+      /** The Bot that was asked. */
+      botId: string;
+      /** Its name when it was asked, or null. Prefer the roster's name when the person has one. */
+      botName: string | null;
+      /** ISO-8601. */
+      since: string;
+    }
+  | {
+      kind: "routine";
+      key: string;
+      routineId: string;
+      /** The Bot the routine runs as. */
+      botId: string;
+      botName: string | null;
+      /** ISO-8601. */
+      since: string;
+    };
+
+/** A channel plus what the roster renders about it. */
+export type ChannelSummary = AgentChannel & {
+  /**
+   * What the conversation is called, or null: the name its owner gave it, else a few words the
+   * server wrote about it. The roster falls back to `opening`, then `name`.
+   */
+  summary: string | null;
+  /**
+   * The person's first words in the conversation, as one plain line, or null. What it is called
+   * until `summary` names it. Absent from a server that predates it, which reads as null.
+   */
+  opening?: string | null;
+  lastMessage: string | null;
+  lastMessageAgentId: string | null;
+  /** ISO-8601. Ordering falls back to this, so a channel just created sorts to the top. */
+  createdAt: string;
+  /** Whether this member pinned the channel. Pinned channels sort first in the roster. */
+  pinned: boolean;
+  /** ISO-8601 when this member last had the channel open, or null for never. The caller's, only. */
+  lastReadAt: string | null;
+  /**
+   * Whether this member started the conversation and so may rename it. The server's answer, which
+   * it enforces too. Absent from a server that predates renaming, which reads as no.
+   */
+  canRename?: boolean;
+  /**
+   * Whether a turn is running in this channel right now.
+   *
+   * Mostly socket-only and transient: a person's own run is announced and never stored, so a
+   * refetch drops it. The roster returns it true for a channel with `work`, which is stored, so a
+   * conversation a Bot is still answering in stays lit across a reload. A headless turn — a handoff
+   * hop, a relay — sets it, which is how the roster shows work the browser never streamed.
+   */
+  busy?: boolean;
+  /**
+   * Whether this is a task's own conversation, which holds one piece of work started from a
+   * check-in. Absent from a server that predates tasks, which reads as not one.
+   */
+  task?: boolean;
+};
+
+export const channelKeys = {
+  all: ["channels"] as const,
+  list: () => ["channels", "list"] as const,
+  /** Every search of the roster, to refetch them together. Never a prefix of `list`. */
+  searches: () => ["channels", "search"] as const,
+  /**
+   * One search, by its normalised text (see `normalizeChannelSearch`) and page size. Its own key,
+   * so a search never writes into the roster's pages and the roster never into a search's.
+   */
+  search: (query: string, limit: number) =>
+    ["channels", "search", { query, limit }] as const,
+  /** Every channel read by id, to refetch them together. */
+  details: () => ["channels", "detail"] as const,
+  detail: (channelId: string) => ["channels", "detail", channelId] as const,
+  /** Every Bot's list of its conversations (the Bots panel), to patch or refetch them together. */
+  byBots: () => ["channels", "bot"] as const,
+  /** One Bot's conversations, as the Bots panel lists them under it. */
+  byBot: (botId: string) => ["channels", "bot", botId] as const,
+  /** The caller's turns in one conversation that were refused before they ran. */
+  refusedTurns: (channelId: string) =>
+    ["channels", "refused-turns", channelId] as const,
+};
+
+/**
+ * One of the caller's turns in a conversation that was refused before it ran: the API's
+ * `RefusedTurn`. Nothing of it reaches the conversation's thread, so the transcript draws it from
+ * here: the message it was for, after `afterMessageId`, and the refusal under it.
+ */
+export type RefusedTurn = ApiRefusedTurn;
+
+/** Every refused turn of the caller's in a conversation, newest first, page by page to the end. */
+export function refusedTurnsQueryOptions(channelId: string) {
+  return queryOptions({
+    queryKey: channelKeys.refusedTurns(channelId),
+    queryFn: ({ signal }): Promise<RefusedTurn[]> =>
+      everyPage(async (cursor) => {
+        const page = await listRefusedTurns(
+          organizationId(),
+          channelId,
+          { limit: 100, ...(cursor ? { cursor } : {}) },
+          {
+            signal,
+            fallback: "Couldn't load this conversation's refused turns.",
+          },
+        );
+        return { items: page.refusedTurns, nextCursor: page.nextCursor };
+      }),
+  });
+}
+
+/** One page of channels, and where the next one starts. */
+export type ChannelPage = {
+  channels: ChannelSummary[];
+  nextCursor: string | null;
+};
+
+/**
+ * The sidebar's channels, a page at a time.
+ *
+ * It used to ask for every channel this person has, one row per channel-agent pair, on every render.
+ * Nothing removes a channel, so somebody who talks to their Bot daily accumulates thousands and the
+ * query grows monotonically for as long as they use the product.
+ *
+ * The pages are flattened for the caller, so the sidebar and the socket that patches it both see one
+ * array in recency order and neither has to know this is paged.
+ */
+export function channelListQueryOptions() {
+  return infiniteQueryOptions({
+    queryKey: channelKeys.list(),
+    initialPageParam: "",
+    queryFn: async ({ pageParam }): Promise<ChannelPage> =>
+      channelPageOf(
+        await listConversations(
+          organizationId(),
+          pageParam ? { cursor: pageParam as string } : undefined,
+          { fallback: "Couldn't load your conversations." },
+        ),
+      ),
+    getNextPageParam: (page: ChannelPage) => page.nextCursor ?? undefined,
+    select: (data): ChannelSummary[] =>
+      data.pages.flatMap((page) => page.channels),
+  });
+}
+
+/**
+ * One Bot's conversations, newest first, `limit` at a time: the Bots panel's list under a Bot, read
+ * from the server (`botId` on listConversations) so a Bot's older conversations are there too, not
+ * only the ones the roster happens to have loaded. Group conversations are listed under each Bot.
+ */
+export function botConversationsInfiniteQueryOptions(
+  botId: string,
+  limit: number,
+) {
+  return infiniteQueryOptions({
+    queryKey: channelKeys.byBot(botId),
+    initialPageParam: "",
+    queryFn: async ({ pageParam }): Promise<ChannelPage> =>
+      channelPageOf(
+        await listConversations(
+          organizationId(),
+          {
+            botId,
+            limit,
+            ...(pageParam ? { cursor: pageParam as string } : {}),
+          },
+          { fallback: "Couldn't load this Bot's conversations." },
+        ),
+      ),
+    getNextPageParam: (page: ChannelPage) => page.nextCursor ?? undefined,
+    select: (data): ChannelSummary[] =>
+      data.pages.flatMap((page) => page.channels),
+  });
+}
+
+/** How many results one page of a search asks for: the server's own default. */
+export const CHANNEL_SEARCH_PAGE = 20;
+
+/** The fewest characters, in code points, that are sent to the server as a search. */
+export const CHANNEL_SEARCH_MIN_CODE_POINTS = 2;
+
+/**
+ * What the server compares a search as: trimmed, and composed so an accent typed as two code points
+ * is the same search as one typed as one. The server does this too; doing it here as well means two
+ * spellings of one search share a cache entry.
+ */
+export function normalizeChannelSearch(text: string): string {
+  return text.trim().normalize("NFC");
+}
+
+/** Whether this text is long enough to search history with. One character matches nearly everything. */
+export function isChannelSearchable(text: string): boolean {
+  return (
+    Array.from(normalizeChannelSearch(text)).length >=
+    CHANNEL_SEARCH_MIN_CODE_POINTS
+  );
+}
+
+/**
+ * Every conversation of this person's that matches `query`, searched by the server a page at a time.
+ *
+ * The server searches the roster's own text (name, summary, opening and latest message) across the
+ * person's whole history. It does not search inside every message of a transcript, which is why
+ * the sidebar says what it searches.
+ *
+ * Disabled until the text is searchable, so a caller can hold this with whatever is in the box. A
+ * request is abandoned through the query's signal once its key goes out of use, and a slower answer
+ * to an earlier search cannot land on a later one, because each search is its own cache entry.
+ * Pages are flattened like the roster's.
+ *
+ * Shared by the sidebar and the command menu.
+ */
+export function channelSearchInfiniteQueryOptions(
+  query: string,
+  limit: number = CHANNEL_SEARCH_PAGE,
+) {
+  const normalized = normalizeChannelSearch(query);
+  return infiniteQueryOptions({
+    queryKey: channelKeys.search(normalized, limit),
+    enabled: isChannelSearchable(normalized),
+    initialPageParam: "",
+    queryFn: async ({ pageParam, signal }): Promise<ChannelPage> =>
+      channelPageOf(
+        await listConversations(
+          organizationId(),
+          {
+            q: normalized,
+            limit,
+            ...(pageParam ? { cursor: pageParam as string } : {}),
+          },
+          { fallback: "Couldn't search your conversations.", signal },
+        ),
+      ),
+    getNextPageParam: (page: ChannelPage) => page.nextCursor ?? undefined,
+    select: (data): ChannelSummary[] =>
+      data.pages.flatMap((page) => page.channels),
+  });
+}
+
+export function channelQueryOptions(channelId: string) {
+  return queryOptions({
+    queryKey: channelKeys.detail(channelId),
+    queryFn: async (): Promise<AgentChannel> =>
+      channelOf(
+        (
+          await getConversation(organizationId(), channelId, {
+            fallback: "Couldn't load this conversation.",
+          })
+        ).conversation,
+      ),
+  });
+}
+
+/**
+ * A conversation as the sidebar's list already holds it, or undefined when the list has not read it.
+ * Nothing is asked: for a screen to name a conversation while its own read is still on its way, as
+ * it is for as long as OpenBot Desktop can't reach the OpenBot it is connected to.
+ */
+export function listedChannel(
+  queryClient: QueryClient,
+  channelId: string,
+): ChannelSummary | undefined {
+  return queryClient
+    .getQueryData<InfiniteData<ChannelPage>>(channelKeys.list())
+    ?.pages.flatMap((page) => page.channels)
+    .find((one) => one.id === channelId);
+}
+
+/**
+ * A conversation as the API answers it, in the names the app's screens and its socket events use:
+ * the API calls a conversation's Bots `botIds`.
+ */
+export function channelOf({ botIds, ...rest }: Conversation): AgentChannel {
+  return { ...rest, agentIds: botIds, work: rest.work as ChannelWork[] };
+}
+
+function channelSummaryOf({
+  botIds,
+  lastMessageBotId,
+  ...rest
+}: ConversationSummary): ChannelSummary {
+  return {
+    ...rest,
+    agentIds: botIds,
+    lastMessageAgentId: lastMessageBotId,
+    work: rest.work as ChannelWork[],
+  };
+}
+
+function channelPageOf(page: {
+  conversations: ConversationSummary[];
+  nextCursor: string | null;
+}): ChannelPage {
+  return {
+    channels: page.conversations.map(channelSummaryOf),
+    nextCursor: page.nextCursor,
+  };
+}

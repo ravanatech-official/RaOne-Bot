@@ -1,0 +1,124 @@
+import { ssoClient } from "@better-auth/sso/client";
+import { createAuthClient } from "better-auth/react";
+import { withClientName } from "@/lib/client";
+import type { AuthProviderId } from "./queries";
+
+export const authClient = createAuthClient({
+  plugins: [ssoClient()],
+  fetchOptions: {
+    // The page's fetch at the time of each call, as every other request in the app uses it, rather
+    // than the one there was when this module loaded. Naming this app, as every request does.
+    customFetchImpl: (input, init) =>
+      fetch(input, { ...init, headers: withClientName(init?.headers) }),
+  },
+});
+
+/** What each provider is called on the button, since none of them are called by their id. */
+const PROVIDER_NAMES: Record<AuthProviderId, string> = {
+  google: "Google",
+  microsoft: "Microsoft",
+  okta: "Okta",
+};
+
+export function providerName(provider: AuthProviderId): string {
+  return PROVIDER_NAMES[provider];
+}
+
+/** What a sign-in attempt came back with, which is either nothing or a reason. */
+type SocialResult = { error?: { message?: string } | null };
+
+/**
+ * Start sign-in with one provider.
+ *
+ * One call for all three, including Okta. Okta is served by the generic OAuth plugin rather than as
+ * a named provider, but the plugin registers under a provider id like any other, so the browser does
+ * not need to know which kind it is asking for. Keeping that distinction on the server is the point:
+ * a deployment can gain a provider without the app being rebuilt.
+ *
+ * `start` is injectable because Better Auth's client is a proxy, so a test cannot replace the method
+ * on it. Named so it cannot shadow anything it defaults to.
+ */
+export async function signInWith(
+  provider: AuthProviderId,
+  start: (input: {
+    provider: string;
+    callbackURL: string;
+  }) => Promise<SocialResult> = (input) =>
+    authClient.signIn.social(input as never) as Promise<SocialResult>,
+  // Where the browser returns to. Defaults to the origin, which is what every caller without
+  // somewhere particular to resume has always got. Same origin as the app, so Better Auth's
+  // trusted-origin check treats it as it treated the bare origin.
+  callbackURL: string = window.location.origin,
+) {
+  const result = await start({ provider, callbackURL });
+
+  if (result.error) {
+    // Naming the provider matters more with three buttons than it did with one: "Could not start
+    // sign-in" leaves somebody looking at three of them with no idea which one refused.
+    throw new Error(
+      result.error.message ||
+        `Could not start ${providerName(provider)} sign-in.`,
+    );
+  }
+}
+
+/**
+ * Link the signed-in person's company account: sign in, while signed in, through one of their organization's identity
+ * providers, by its id. The server links what the provider vouches for to the account they already have (as a GitHub
+ * member authenticates their SAML identity to an organization) rather than opening another, and the browser comes back
+ * to `callbackURL` with both.
+ *
+ * By the provider's id, not by address: somebody who joined with a personal address has none at the company's domain.
+ * Injectable for the same reason as `signInWith`: the Better Auth client is a proxy.
+ */
+export async function linkCompanyAccount(
+  providerId: string,
+  start: (input: {
+    providerId: string;
+    callbackURL: string;
+  }) => Promise<SocialResult> = (input) =>
+    (
+      authClient as unknown as {
+        signIn: { sso: (i: unknown) => Promise<SocialResult> };
+      }
+    ).signIn.sso(input),
+  callbackURL: string = window.location.href,
+) {
+  const result = await start({ providerId, callbackURL });
+  if (result.error)
+    throw new Error(
+      result.error.message || "Couldn't start signing in with your company.",
+    );
+}
+
+/**
+ * Start sign-in through whichever identity provider covers this address.
+ *
+ * The email is not a credential here and no password is asked for: only the part after the @ is
+ * used, to decide which registered provider to hand somebody to. A company with two IdPs mid-merger
+ * has two domains, and this is how somebody reaches theirs without being asked which one they are.
+ *
+ * Injectable for the same reason as `signInWith`: the Better Auth client is a proxy.
+ */
+export async function signInWithEmailDomain(
+  email: string,
+  start: (input: {
+    email: string;
+    callbackURL: string;
+  }) => Promise<SocialResult> = (input) =>
+    (
+      authClient as unknown as {
+        signIn: { sso: (i: unknown) => Promise<SocialResult> };
+      }
+    ).signIn.sso(input),
+  callbackURL: string = window.location.origin,
+) {
+  const result = await start({ email, callbackURL });
+
+  if (result.error) {
+    throw new Error(
+      result.error.message ||
+        "No identity provider is registered for that address.",
+    );
+  }
+}

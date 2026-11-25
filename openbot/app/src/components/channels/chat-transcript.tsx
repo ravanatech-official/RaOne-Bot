@@ -1,0 +1,2863 @@
+import type { ActivityMessage, Message } from "@ag-ui/core";
+import type { Attachment } from "@copilotkit/react-core/v2";
+import {
+  useCopilotKit,
+  useRenderActivityMessage,
+  useRenderToolCall,
+} from "@copilotkit/react-core/v2";
+import { outcomeForPerson } from "@openbot/shared/approval-outcomes";
+import {
+  readConnectPrompt,
+  SHOW_APP_ACCESS_TOOL,
+} from "@openbot/shared/connect-prompt";
+import { answeredBy } from "@openbot/shared/handoff-markers";
+import { readBrief, readTaskReport } from "@openbot/shared/orchestration";
+import { SUBAGENT_TOOL } from "@openbot/shared/subagent";
+import {
+  answersTheModel,
+  ownToolAttempt,
+  ownToolSubject,
+  readToolName,
+} from "@openbot/shared/tool-name";
+import { SEARCH_TOOLS, toolsFound } from "@openbot/shared/tool-search";
+import {
+  IconAlertTriangle,
+  IconArrowsMaximize,
+  IconBox,
+  IconChevronDown,
+  IconClock,
+  IconDownload,
+  IconPhoto,
+} from "@tabler/icons-react";
+import { QueryClientContext, useQuery } from "@tanstack/react-query";
+import { motion, useReducedMotion } from "motion/react";
+import {
+  createContext,
+  Fragment,
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { InlineApproval } from "@/components/approvals/inline-approval";
+import { AddModelKeyLink } from "@/components/channels/add-model-key-link";
+import {
+  ArgumentsArrivingContext,
+  TurnInFlightContext,
+} from "@/components/gallery/streaming";
+import { AddCardButton } from "@/components/plan/add-card-button";
+import {
+  SettingsToolCall,
+  settingsToolCardFor,
+} from "@/components/settings-tools/settings-tool-card";
+import { reportsUnderTheirCards } from "@/components/tasks/report-under-card";
+import { SteerLanded } from "@/components/tasks/task-steer";
+import {
+  MessageReactions,
+  SentFromBot,
+  TaskReport,
+} from "@/components/tasks/task-thread";
+import {
+  publishThreadWork,
+  threadWorkOf,
+} from "@/components/tasks/thread-work";
+import { foldTurnWork, NO_TURN_WORK } from "@/components/tasks/turn-work";
+import {
+  isTaskThread,
+  useWaitingToolCalls,
+  WorkedFor,
+} from "@/components/tasks/worked-for";
+import { Bubble, BubbleContent } from "@/components/ui/bubble";
+import { Button } from "@/components/ui/button";
+import {
+  Item,
+  ItemActions,
+  ItemContent,
+  ItemDescription,
+  ItemMedia,
+} from "@/components/ui/item";
+import {
+  MessageContent,
+  MessageFooter,
+  MessageHeader,
+  Message as MessageRow,
+} from "@/components/ui/message";
+import {
+  conversationFitsInView,
+  MessageScroller,
+  MessageScrollerButton,
+  MessageScrollerContent,
+  MessageScrollerItem,
+  MessageScrollerProvider,
+  MessageScrollerViewport,
+} from "@/components/ui/message-scroller";
+import { Skeleton } from "@/components/ui/skeleton";
+import { agentListQueryOptions } from "@/lib/agents/queries";
+import {
+  attachmentAddress,
+  attachmentUrl,
+  LARGEST_PICTURE_DRAWN_INLINE,
+} from "@/lib/channels/attachments";
+import { readResponsibilityTurn } from "@/lib/channels/responsibility-turn";
+import { readFiring } from "@/lib/channels/routine-firing";
+import { fileSize, kindLabel } from "@/lib/computers/sent-file";
+import type { CardPlace } from "@/lib/copilot/carry-on";
+import { foreignCodingCall } from "@/lib/copilot/coding-calls";
+import { ToolPlaceContext } from "@/lib/copilot/tool-place";
+import { useComponentTest } from "@/lib/copilot/tool-steps";
+import { deploymentCapabilitiesQueryOptions } from "@/lib/deployment/queries";
+import {
+  type FolderNames,
+  FolderNamesContext,
+  folderNamesIn,
+  folderStepBody,
+  folderStepSubject,
+} from "@/lib/folders/folder-steps";
+import {
+  BotMarkdown,
+  markdownComponents,
+  markdownPlugins,
+  replyRemarkPluginsFor,
+} from "@/lib/markdown";
+import { EASE_OUT, ENTRANCE_SECONDS } from "@/lib/motion";
+import {
+  RESEARCH_RESULTS_LABELS,
+  readResearchSources,
+  researchRoleOfCall,
+} from "@/lib/plugins/research-results";
+import {
+  asText,
+  CUT_OFF_SENTENCE,
+  cutOffStep,
+  forDisplay,
+  refusalOf,
+  toolResultFailed,
+  UNOFFERED_TOOL_SENTENCE,
+  unofferedTool,
+} from "@/lib/plugins/tool-result";
+import { useResultVisibility } from "@/lib/product-telemetry";
+import {
+  NO_SLACK_NAMES,
+  type SlackNames,
+  slackNamesIn,
+} from "@/lib/slack/mentions";
+import { readTeamBotConsent } from "@/lib/team-bots";
+import { cn } from "@/lib/utils";
+import { VOICE_CHAT_ACTIVITY, type VoiceChatEntry } from "@/lib/voice/archive";
+import { AppAccessCard } from "./app-access-card";
+import {
+  AttachmentLightbox,
+  LightboxPicture,
+  unavailableSentence,
+  useDocumentIsGone,
+  useFileFacts,
+} from "./attachment-view";
+import { ChannelAvatar } from "./avatar";
+import { isBrowserStep } from "./browser-activity";
+import {
+  attachmentModality,
+  type SentAttachment,
+  toVisibleChatItems,
+} from "./chat-messages";
+import { splitChatOrigin } from "./chat-origin";
+import type { QueuedMessage } from "./composer";
+import { FileTypeIcon } from "./file-icon";
+import { FollowScroll, RESUME_PX, useFollowIntent } from "./follow-intent";
+import { LateRenderersContext, LateRenderersWatch } from "./late-renderers";
+import { usePacedReveal } from "./paced-reveal";
+import { ResearchResults } from "./research-results";
+import { TeamBotConsentCard } from "./team-bot-consent";
+import {
+  dropRepeatedAppCards,
+  groupToolSteps,
+  ToolActivity,
+  type ToolGroup,
+  type TranscriptItem,
+  useDrawnTool,
+} from "./tool-activity";
+import { ToolRenderBoundary, toolCallFinal } from "./tool-boundary";
+import { ToolLine } from "./tool-line";
+import { shouldDrawEarlier, useTranscriptPages } from "./transcript-pages";
+import { TranscriptRail } from "./transcript-rail";
+import {
+  AT_END_PX,
+  currentTurn,
+  isPersonSentMessage,
+  type Turn,
+  turnsOf,
+} from "./transcript-turns";
+import { VoiceChatCard } from "./voice-chat-card";
+
+type ChatTranscriptProps = {
+  /** Server-owned thread identity, used only to correlate rendered result messages. */
+  threadId?: string;
+  busy?: boolean;
+  /**
+   * The `/` commands, as JSON from each command to its name: tells a skill chip from a leading
+   * slash, and names the skill on its badge. See `skillLabels`.
+   */
+  commandLabels?: string;
+  /**
+   * Drawn above the first message, as the first thing in the scroll content, so it scrolls away
+   * with the conversation. Only once the earliest page is drawn: see where it is rendered.
+   */
+  intro?: React.ReactNode;
+  messages: ReadonlyArray<Readonly<Message>>;
+  /**
+   * Typed while the Bot had the turn, and waiting for it to finish. Empty on a screen that does not
+   * offer queueing at all.
+   */
+  queued?: readonly QueuedMessage[];
+  /** Take one back before it runs. Without it a queued line is shown but cannot be undone. */
+  onRemoveQueued?: (id: string) => void;
+  /** Stop the turn and send this one next. Without it a queued line waits for the turn to end. */
+  onSendQueuedNow?: (id: string) => void;
+  /** History has been asked for and has not arrived. Drawn only when there is nothing else to draw. */
+  restoring?: boolean;
+  /**
+   * Why the last turn ended without an answer, if it did.
+   *
+   * A sentence rather than a flag, because the reasons are not interchangeable: a Bot that refused,
+   * a Bot whose endpoint is down and a Bot that simply stopped talking are three different things to
+   * be told, and only the thing that ended the turn knows which one happened.
+   */
+  stopped?: string;
+  /**
+   * The turns the server refused for the person, by the id of the person's message each answered:
+   * the sentence it said. Each is drawn under its own message, as `stopped` is under the last, and
+   * stays there when a later turn is sent. A refusal is not the last turn's state but a fact about
+   * that message, so a second refusal must not take the first one's notice away.
+   */
+  refusals?: ReadonlyMap<string, string>;
+  /**
+   * Carry on with a turn that was cut off part way, drawn as a button beside `stopped`. Absent for
+   * a turn that ended for a reason carrying on would not fix (a refusal, a Bot no longer shared).
+   */
+  onCarryOn?: () => void;
+  /**
+   * Work this conversation is waiting on that is not this tab's run: a Bot it asked, a routine.
+   * Drawn in the same slot as `Thinking`, under the last thing said, because that is where the
+   * answer will appear.
+   */
+  working?: React.ReactNode;
+};
+
+/** One shared empty array, so a screen without a queue does not hand down a new one per render. */
+const EMPTY_QUEUE: readonly QueuedMessage[] = [];
+const NO_REFUSALS: ReadonlyMap<string, string> = new Map();
+
+/** The person's message a row is part of: a message's attachments row is `<id>:attachments`. */
+function personMessageOf(rowId: string): string {
+  return rowId.endsWith(":attachments")
+    ? rowId.slice(0, -":attachments".length)
+    : rowId;
+}
+
+/**
+ * The `/` commands handed to the transcript, from each command to the skill's name.
+ *
+ * A string of JSON rather than an object, because message rows are memoised on primitives; see
+ * where `ChatTranscript` is drawn. Built by {@link skillLabels}, read back by {@link splitSkillChip}.
+ */
+export function skillLabels(
+  commands: readonly { id: string; name: string }[],
+): string {
+  return JSON.stringify(
+    Object.fromEntries(commands.map((command) => [command.id, command.name])),
+  );
+}
+
+function readLabels(labels: string): Record<string, string> {
+  try {
+    const parsed: unknown = JSON.parse(labels || "{}");
+    return parsed && typeof parsed === "object"
+      ? (parsed as Record<string, string>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Split a person's message into the skill they invoked and the rest of what they typed.
+ *
+ * ONLY A KNOWN COMMAND COUNTS. "/etc/hosts is broken" is a sentence, not a skill, and drawing a chip
+ * around it would invent a thing that never happened. The commands come from the same list the `/`
+ * menu was built from, so this stays true as skills are granted and revoked.
+ *
+ * The message carries the command (`/standup`), which never changes; the badge shows the skill's
+ * name, as the menu and the composer's chip did.
+ *
+ * The trigger only opens at the start of a line, so the chip is the first token or there is none.
+ */
+function splitSkillChip(
+  text: string,
+  commandLabels: string,
+): { chip: string; rest: string } | null {
+  const match = /^\/([a-z0-9][a-z0-9-]*)(\s|$)/.exec(text);
+  if (!match?.[1]) {
+    return null;
+  }
+  const name = readLabels(commandLabels)[match[1]];
+  if (!name) {
+    return null;
+  }
+  return { chip: name, rest: text.slice(match[0].length) };
+}
+
+/**
+ * The shape of a conversation, while it is still being fetched. Shaped like what is coming rather
+ * than like a loading widget, on the same line pitch so the column does not jump when words land.
+ */
+const RESTORING_ANSWER_LINES = [
+  { id: "line-1", width: "w-full" },
+  { id: "line-2", width: "w-11/12" },
+  { id: "line-3", width: "w-full" },
+  { id: "line-4", width: "w-10/12" },
+  { id: "line-5", width: "w-11/12" },
+  { id: "line-6", width: "w-full" },
+  { id: "line-7", width: "w-11/12" },
+  { id: "line-8", width: "w-2/3" },
+] as const;
+
+export function RestoringTranscript() {
+  return (
+    // One announcement, with every bar hidden from it: nine empty shapes read aloud is worse.
+    <div aria-label="Loading this conversation" role="status">
+      <div aria-hidden="true" className="flex justify-end pb-7">
+        <Skeleton className="h-10 w-64 rounded-xl bg-muted/40 motion-reduce:animate-none" />
+      </div>
+      <div aria-hidden="true" className="flex flex-col gap-3">
+        {RESTORING_ANSWER_LINES.map((line) => (
+          <Skeleton
+            className={`h-4 bg-muted/40 motion-reduce:animate-none ${line.width}`}
+            key={line.id}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The Bot has the turn and has produced nothing yet.
+ *
+ * THE GAP THIS FILLS IS THE WORST ONE IN THE CONVERSATION. Between pressing send and the first token
+ * there was `aria-busy` and nothing else: announced to a screen reader, invisible to everybody else.
+ * A person who has just asked something watches their own message sit there, and a Bot that is
+ * thinking is indistinguishable from a Bot that failed silently — which this app has shipped before.
+ *
+ * It borrows the shimmer a running tool line uses, so "working on it" reads the same whether the
+ * work is a tool call or a model that has not spoken yet.
+ */
+function Thinking() {
+  return (
+    <p
+      className="tool-line-running text-muted-foreground text-sm"
+      // `status` rather than `alert`: this is progress, not something that interrupts what somebody
+      // is doing. The text says it, so a screen reader is told the same thing the shimmer implies.
+      role="status"
+    >
+      Thinking
+    </p>
+  );
+}
+
+/**
+ * Whether the whole conversation is in view (`conversationFitsInView`), measured again whenever the
+ * view's size changes or a row is drawn, grows or goes, at most once a frame. A streamed reply
+ * changes its text many times a second; the frame keeps that to one measure per paint.
+ */
+function useAllInView(
+  viewportRef: React.RefObject<HTMLDivElement | null>,
+  /** While history loads there is no view yet; it is looked for again once there is. */
+  restoring: boolean,
+): boolean {
+  const [allInView, setAllInView] = useState(false);
+  useEffect(() => {
+    if (restoring) return;
+    const viewport = viewportRef.current;
+    const content = viewport?.querySelector<HTMLElement>(
+      "[data-slot=message-scroller-content]",
+    );
+    if (!viewport || !content) return;
+    let frame = 0;
+    const measure = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() =>
+        setAllInView(conversationFitsInView(content)),
+      );
+    };
+    measure();
+    const resized =
+      typeof ResizeObserver === "undefined"
+        ? null
+        : new ResizeObserver(measure);
+    resized?.observe(viewport);
+    resized?.observe(content);
+    const changed = new MutationObserver(measure);
+    changed.observe(content, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      resized?.disconnect();
+      changed.disconnect();
+    };
+  }, [viewportRef, restoring]);
+  return allInView;
+}
+
+/**
+ * The turn ended and no answer came.
+ *
+ * In the same slot as `Thinking`, and for the same reason it is there: the person is looking at the
+ * bottom of the transcript, immediately under their own message, because that is where the answer
+ * was going to appear. Saying so above the composer put the explanation in a different part of the
+ * screen from the gap it explains, and left the last thing in the conversation looking unfinished.
+ *
+ * NOT A MESSAGE, deliberately. It has no id, is never anchored, and is gone the moment the next turn
+ * starts. Making it a transcript row would put a sentence into the conversation that nobody said,
+ * and the conversation is sent back to the model on the next turn, so the Bot would then read its
+ * own obituary as something it had written.
+ */
+function Stopped({
+  reason,
+  onCarryOn,
+}: {
+  reason: string;
+  /** A turn cut off part way can be carried on from here. See `onCarryOn` on the transcript. */
+  onCarryOn?: () => void;
+}) {
+  /*
+   * The app's notice: one outlined row, its icon in the media tile, the sentence in the foreground
+   * where it reads as words rather than as an error code in red, and the one way on beside it (on a
+   * phone, under it). Drawn as plain red text it read as a fault in the screen, not as something the
+   * person could act on.
+   */
+  return (
+    <Item
+      /*
+       * Card-filled, and framed in both themes as every card in a conversation is (the help-request
+       * card, `dark:border-border`): an outlined row drops its border in dark, and there the notice
+       * read as a filled block with no edge.
+       */
+      className="w-full bg-card dark:border-border"
+      data-testid="transcript-stopped"
+      size="sm"
+      variant="outline"
+    >
+      <ItemMedia variant="icon">
+        <IconAlertTriangle className="text-destructive" />
+      </ItemMedia>
+      <ItemContent className="min-w-0">
+        <ItemDescription
+          className="line-clamp-none text-foreground text-sm"
+          role="alert"
+        >
+          {reason}
+        </ItemDescription>
+      </ItemContent>
+      {/* Nothing drawn when there is no way on: the actions below render nothing then. */}
+      <ItemActions className="empty:hidden max-sm:basis-full">
+        {onCarryOn ? (
+          <Button onClick={onCarryOn} size="sm" variant="outline">
+            Carry on
+          </Button>
+        ) : (
+          <>
+            {/* A run refused because the organization needs a card is answered where it was refused. */}
+            <AddCardButton />
+            {/* And one with no model key, for an admin who can add it. */}
+            <AddModelKeyLink reason={reason} />
+          </>
+        )}
+      </ItemActions>
+    </Item>
+  );
+}
+
+/**
+ * A file staged on the composer, described the way a sent one is.
+ *
+ * So that a parked message draws the SAME tiles the turn will draw once it runs, rather than a
+ * second rendering of an attachment that has to be kept in step with this one. The composer's
+ * `onUpload` has already put the row on the server and handed back its url — `canSendDraft` refuses
+ * to send, and therefore to park, anything still uploading — so there is always something to point
+ * at by the time one of these reaches here.
+ *
+ * Anything that is not a picture becomes a document tile, which is what the sent row does with the
+ * modalities it has no preview for: a card naming the file is the honest drawing of "this came
+ * along", and the alternative is a broken thumbnail.
+ *
+ * WHICH ONES ARE PICTURES IS ASKED OF THE SERVER'S ANSWER, NOT OF `attachment.type`, and this is
+ * the one surface in the browser where that answer is actually in hand. `attachment.type` is the
+ * SDK's `getModalityFromMimeType(file.type)` from before the upload, never revisited when the
+ * upload replies; `attachment.source.mimeType` is what OUR `onUpload` put there, and that is
+ * `body.mimeType` — the type the server earned from `sniffMimeType` over the bytes
+ * (`composer/attachments.ts`). A PNG the browser called `text/plain` has `type: "document"` and
+ * `source.mimeType: "image/png"`, and this used to draw a grey card over it.
+ *
+ * A PARKED MESSAGE HOLDS THE LIVE `Attachment`, WHICH IS WHY THIS CAN BE PUT RIGHT AND THE SENT ROW
+ * CANNOT. `QueuedMessage.attachments` is `Attachment[]` — the staged object itself, source and all
+ * — whereas a sent turn has been through `toAttachmentPart` (`channel-chat.tsx`), which rebuilds
+ * the source as `{ type: "url", value }` and drops the `mimeType` on the floor. So the two tiles
+ * genuinely can disagree for as long as that line stands: a mislabelled picture draws correctly
+ * here and reverts to a file card the moment the turn runs.
+ *
+ * That flip is a real cost and it is still the right way round. It is the symptom of the missing
+ * line rather than a reason to keep this tile wrong on purpose, and the alternative — throwing away
+ * an answer we hold so that both surfaces are wrong together — is the kind of consistency that
+ * hides the defect instead of paying it down. `attachmentModality` is shared with the sent path
+ * precisely so that fixing the source there needs no second change here.
+ */
+function parkedTiles(attachments: readonly Attachment[]): SentAttachment[] {
+  return attachments.map((attachment) => {
+    const attachmentId = (attachment.metadata as { attachmentId?: unknown })
+      ?.attachmentId;
+    /*
+     * Narrowed rather than read straight through, for the reason the sent path narrows the same
+     * field: `Attachment["source"]` is a union whose `data` member REQUIRES `mimeType` and whose
+     * `url` member does not, and a `data` source here carries `file.type` — the browser's claim,
+     * which is the very thing this is refusing to trust. Only a url source has been near the
+     * server. A staged attachment still uploading is exactly that case (`{ type: "data", value: "",
+     * mimeType: file.type }`), and while `canSendDraft` refuses to park one, this costs nothing and
+     * means the guard does not depend on that staying true.
+     */
+    const { source } = attachment;
+    const mimeType =
+      source.type === "url" && source.mimeType ? source.mimeType : undefined;
+
+    return {
+      id: attachment.id,
+      attachmentId:
+        typeof attachmentId === "string" ? attachmentId : attachment.id,
+      url: source.value,
+      ...(attachment.filename ? { filename: attachment.filename } : {}),
+      modality: attachmentModality(attachment.type, mimeType),
+      ...(typeof attachment.size === "number"
+        ? { sizeBytes: attachment.size }
+        : {}),
+      ...(mimeType ? { mimeType } : {}),
+    };
+  });
+}
+
+/** What a parked message is called, for somebody who cannot see it: its words, or else its files. */
+function describeParked(
+  text: string,
+  files: readonly SentAttachment[],
+): string {
+  if (text) {
+    return text;
+  }
+  const named = files
+    .map((file) => file.filename)
+    .filter((filename) => filename !== undefined);
+
+  return named.length > 0 ? named.join(", ") : "attachment";
+}
+
+/**
+ * Something the person said while the Bot was working, waiting its turn.
+ *
+ * IT IS DRAWN AS THEIR MESSAGE, NOT AS A NOTICE ABOUT ONE. The whole point of letting somebody type
+ * mid-turn is that they can see their words landed, and a status line saying "1 message queued"
+ * does not do that — they would still be wondering whether the sentence they typed is the sentence
+ * that will run. So it is the same bubble, in the same column, with the same wrapping, and only two
+ * things say it has not run yet: it is faded, and it says so underneath.
+ *
+ * The footer carries the taking-back too, because that is where the reader's eye already is once
+ * they have decided this was a mistake, and because a control on the bubble itself would have to
+ * hover over the words it is offering to delete.
+ */
+function Queued({
+  attachments,
+  next,
+  text,
+  onRemove,
+  onSendNow,
+}: {
+  attachments: readonly Attachment[];
+  /** Send now was pressed: the turn is stopping, and this goes the moment it ends. */
+  next: boolean;
+  text: string;
+  onRemove?: (() => void) | undefined;
+  onSendNow?: (() => void) | undefined;
+}) {
+  /*
+   * THE FILES COME WITH IT, and until they did they were on NO SURFACE IN THE APP AT ALL. Parking
+   * consumes the draft, so the composer's strip empties in the same beat this line appears; drawing
+   * only `text` meant somebody who attached a screenshot mid-turn watched it vanish from the
+   * composer and never show up anywhere else. Same tiles as a sent turn, in the same order —
+   * pictures above the words — because this IS their message, just not yet run.
+   */
+  const files = parkedTiles(attachments);
+
+  return (
+    <MessageRow align="end">
+      <MessageContent>
+        {files.length > 0 ? (
+          <AttachmentTiles attachments={files} className="opacity-60" />
+        ) : null}
+        {/*
+         * NO WORDS, NO BUBBLE. A screenshot pasted mid-turn with nothing typed is the ordinary way
+         * this gets used, and it drew an empty muted bubble above the footer — which reads as a
+         * message sent by mistake rather than as a file waiting its turn.
+         */}
+        {text ? (
+          <Bubble align="end" className="opacity-60" variant="muted">
+            <BubbleContent>
+              {/* Shown exactly as typed, for the same reason a sent message is. */}
+              <span className="whitespace-pre-wrap">{text}</span>
+            </BubbleContent>
+          </Bubble>
+        ) : null}
+        <MessageFooter>
+          {/*
+           * `status` rather than `alert`, matching the thinking line: a person who has just chosen
+           * to queue something is not being interrupted by the news that it is queued.
+           */}
+          <span role="status">{next ? "Up next" : "Queued"}</span>
+          {/*
+           * SEND NOW, BESIDE REMOVE AND DRAWN THE SAME WAY: the two things a person can do with a
+           * message that is waiting. Named after the sentence it sends, as Remove is, so three of
+           * them in a row are told apart by a screen reader. Gone once pressed, while the turn
+           * stops: the status says what happens next.
+           */}
+          {onSendNow && !next ? (
+            <button
+              aria-label={`Send queued message now: ${describeParked(text, files)}`}
+              className="ml-2 underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+              onClick={onSendNow}
+              type="button"
+            >
+              Send now
+            </button>
+          ) : null}
+          {onRemove ? (
+            <button
+              /*
+               * The sentence it deletes, in the name. Three parked corrections put three buttons
+               * called "Remove" in a row, and somebody reading by name alone is told what they can
+               * do and nothing about which one it would happen to. The visible word stays short
+               * because the bubble it sits under is the answer for everybody who can see it.
+               *
+               * With no sentence to name it by, the FILES are what it deletes — see
+               * `describeParked`. An attachment-only message named the label after an empty string
+               * and read as "Remove queued message:", which is the same nothing three times over.
+               */
+              aria-label={`Remove queued message: ${describeParked(text, files)}`}
+              className="ml-2 underline underline-offset-2 hover:text-foreground focus-visible:outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+              onClick={onRemove}
+              type="button"
+            >
+              Remove
+            </button>
+          ) : null}
+        </MessageFooter>
+      </MessageContent>
+    </MessageRow>
+  );
+}
+
+/**
+ * Put the newest queued message where the person who just typed it can see it.
+ *
+ * WITHOUT THIS THE AFFORDANCE IS INVISIBLE EXACTLY WHEN IT MATTERS. The scroller holds its anchor on
+ * the turn being answered rather than following the bottom, so during a long streamed answer the
+ * transcript sits a screen or so above the end — and a line appended below it lands off screen.
+ * Measured at the point somebody would actually use this: eighty-odd pixels under the fold, with
+ * the composer emptying at the same moment. They would have watched their correction vanish.
+ *
+ * Keyed on the newest queued id rather than on the list, so it does not fire again for every chunk
+ * of the answer still streaming above it. It does fire when the bottom-most queued line is taken
+ * back, which is a scroll nobody asked for and which lands on the end of the conversation anyway,
+ * and it stays quiet on a drain, when the id goes to null.
+ *
+ * IT COSTS THE ANCHOR, AND THAT IS THE PRICE OF THE SCROLL RATHER THAN A SIDE EFFECT OF IT.
+ * `scrollToEnd` drops whatever turn the scroller was holding its position against and starts
+ * following the bottom instead, so the rest of that answer streams past under the reader rather
+ * than staying put beneath the question. Somebody who has just typed at the bottom of the
+ * conversation has asked to be at the bottom of the conversation, so following it is the reading
+ * they chose; but they chose it for the whole turn and not only for the moment, and the button
+ * back to the anchored view is the scroller's own, not ours to restore.
+ *
+ * Rendering nothing and living inside the provider is what buys access to the scroller at all; the
+ * alternative is threading a ref out through three components with no other reason to know a
+ * scroller exists.
+ */
+function ScrollNewestQueuedIntoView({
+  newest,
+  onQueued,
+}: {
+  newest: string | null;
+  onQueued: () => void;
+}) {
+  useEffect(() => {
+    if (newest === null) {
+      return;
+    }
+    // Through the follow state, so the view is told to follow before it is sent to the end.
+    onQueued();
+  }, [newest, onQueued]);
+
+  return null;
+}
+
+/**
+ * How many of the newest rows render in when a conversation opens, and how far apart.
+ *
+ * The view has already landed at the bottom before the first paint, so these are the rows on
+ * screen; the stagger runs top of the screen first, newest last. Short on purpose: eight rows 30ms
+ * apart is a little over 200ms before the last one starts, which reads as the conversation
+ * appearing rather than as it loading. Older rows, above the fold, are simply there.
+ */
+const OPENING_STAGGER_COUNT = 8;
+const OPENING_STAGGER_MS = 30;
+
+/**
+ * The opening stagger, decided once from the rows present when the conversation opens.
+ *
+ * Applied as a CSS animation on the scroller's row wrapper, not on the memoised row inside it: the
+ * row's props stay the same and a streaming answer can never replay it, and a transform composites
+ * without moving the layout box the scroller just landed on. Exported for its tests.
+ */
+export function openingStagger(ids: readonly string[]): Map<string, string> {
+  const start = Math.max(0, ids.length - OPENING_STAGGER_COUNT);
+  return new Map(
+    ids
+      .slice(start)
+      .map((id, index) => [id, `${index * OPENING_STAGGER_MS}ms`] as const),
+  );
+}
+
+/** Where a turn jumped to from the rail sits below the top of the view. */
+const TURN_INSET_PX = 24;
+
+/**
+ * Since when a row mounting now is arriving live, rather than having been there when the
+ * conversation opened: null while it is not.
+ *
+ * A ref, not state: it is read once, at a row's first render, and setting it must not re-render
+ * anything. `ArrivalsLive` provides a fresh one with the scroller, so it is null for the commit that
+ * mounts the whole history and set to the time in the effect after it; every row mounted from then
+ * on is something that arrived while the person was here. The time is for a row that can say when
+ * what it shows happened (see `useArrivedLive`).
+ */
+const ArrivalsLiveContext = createContext<React.RefObject<
+  number | null
+> | null>(null);
+
+/*
+ * For rows drawn later but older than everything on screen: an earlier page added above as the
+ * reader scrolls up (`useTranscriptPages`). They are history, so they draw at rest.
+ */
+const AT_REST: React.RefObject<number | null> = { current: null };
+
+function ArrivalsLive({ children }: { children: React.ReactNode }) {
+  const live = useRef<number | null>(null);
+  useEffect(() => {
+    live.current = Date.now();
+  }, []);
+  return (
+    <ArrivalsLiveContext.Provider value={live}>
+      {children}
+    </ArrivalsLiveContext.Provider>
+  );
+}
+
+/**
+ * Whether this row arrived while the conversation was open, decided once at its first render (see
+ * `ArrivalsLiveContext`), so a reply streaming into it can never change the answer.
+ *
+ * `happenedAt` is for a row that is late rather than new: a voice chat from before the conversation
+ * opened, when the voice service answered after the conversation was already showing. It mounts
+ * among rows on screen but is history, and draws at rest.
+ */
+function useArrivedLive(happenedAt?: string): boolean {
+  const liveRef = useContext(ArrivalsLiveContext);
+  const [live] = useState(() => {
+    if (liveRef === null) return true;
+    const since = liveRef.current;
+    if (since === null) return false;
+    return happenedAt === undefined || !(Date.parse(happenedAt) < since);
+  });
+  return live;
+}
+
+/**
+ * How Streamdown draws a Bot's message, decided once when the message mounts. History is finished
+ * text and takes the static renderer, which does no repair of half-written markdown; anything that
+ * arrived live, or was still streaming when the conversation opened, takes the streaming one and
+ * keeps it after it finishes, so the renderer never changes under the reader. Exported for its test.
+ */
+export function messageMode(
+  live: boolean,
+  streaming: boolean,
+): "static" | "streaming" {
+  return live || streaming ? "streaming" : "static";
+}
+
+/**
+ * A turn arriving in the transcript.
+ *
+ * WHY IT ANIMATES AT ALL: a message currently pops into existence at full opacity, and the eye has
+ * nothing to follow from the composer to the transcript. This bridges that, and nothing more — it
+ * is not decoration on something the reader is trying to read.
+ *
+ * IT RUNS ONCE, ON MOUNT. `initial`/`animate` fire when the element mounts, and the memoised parents
+ * mean a streaming answer re-renders without remounting — so the fade plays when the message first
+ * appears and never again while its text is still arriving. Animating per chunk would strobe.
+ *
+ * TRANSFORM AND OPACITY ONLY, so the scroller can still measure. `MessageScroller` sizes items and
+ * places its anchor and spacer from layout; a transform is composited and changes no layout box, so
+ * a message can fade in without moving the thing the scroller just measured.
+ *
+ * The full transform string rather than motion's `y` shorthand: the shorthand is not hardware
+ * accelerated and drops frames exactly when the main thread is busy, which here is while a reply is
+ * streaming.
+ *
+ * ONLY FOR WHAT ARRIVES WHILE THE CONVERSATION IS OPEN. A row mounted with the history draws at
+ * rest here and takes the opening stagger instead (`openingStagger`); `ArrivalsLiveContext` says
+ * which is which, decided once at the row's first render so a streaming answer can never replay it.
+ */
+function Arriving({
+  children,
+  happenedAt,
+}: {
+  children: React.ReactNode;
+  /** When what the row shows happened, if it can say; see `useArrivedLive`. */
+  happenedAt?: string;
+}) {
+  const shouldReduceMotion = useReducedMotion();
+  const live = useArrivedLive(happenedAt);
+
+  return (
+    <motion.div
+      animate={{ opacity: 1, transform: "translateY(0px)" }}
+      /*
+       * `data-slot` IS LOAD-BEARING, NOT DECORATION. `MessageContent` right-aligns a person's own
+       * message with `group-data-[align=end]/message:*:data-slot:self-end` — a selector that reaches
+       * DIRECT CHILDREN CARRYING A data-slot. Wrapping the bubble in a plain div made this the direct
+       * child, the selector matched nothing, and every message a person sent quietly moved to the
+       * left column and read as though the Bot had said it.
+       */
+      data-slot="message-arriving"
+      /*
+       * FULL WIDTH, AND A FLEX COLUMN, because that is what it displaced. `Bubble` is
+       * `w-fit max-w-[80%]` and aligns itself with `group-data-[align=end]/message:self-end`. Both
+       * need the parent this wrapper replaced: against a shrink-to-fit box the 80% resolves against
+       * the bubble's own width and short messages wrap for no reason, and `self-end` does nothing at
+       * all outside a flex container.
+       */
+      className="flex w-full flex-col"
+      initial={
+        live
+          ? {
+              opacity: 0,
+              // Reduced motion keeps the fade and drops the movement: gentler, not absent.
+              transform: shouldReduceMotion ? "none" : "translateY(8px)",
+            }
+          : false
+      }
+      transition={{
+        duration: ENTRANCE_SECONDS,
+        ease: EASE_OUT,
+      }}
+    >
+      {children}
+    </motion.div>
+  );
+}
+
+/**
+ * A turn a schedule asked for, drawn as the event it is.
+ *
+ * The frame around a firing is addressed to the model — see `shared/routine-firing.ts` — and it
+ * reached the transcript wearing `role: "user"`, which drew it as a muted bubble on the right, in
+ * the exact style of something the person typed. Somebody reading back through a channel found
+ * three sentences of instructions to a model in their own voice, telling their Bot what it may not
+ * do. For a product whose whole claim is that a Bot is a coworker you can hold to account, a record
+ * that misattributes who said what is the one thing it cannot afford.
+ *
+ * So: start-aligned and muted, because this is not the person speaking; the clock, because that is
+ * what a routine already is everywhere else in the app; and the instruction ALONE, because that is
+ * the part a person wrote and the only part addressed to them.
+ */
+function RoutineFiring({
+  instruction,
+  refused = false,
+}: {
+  instruction: string;
+  /** Refused before it ran (its notice is under it): it didn't run, so it doesn't say it did. */
+  refused?: boolean;
+}) {
+  const responsibility = readResponsibilityTurn(instruction);
+  if (responsibility) {
+    return <ResponsibilityFiring raw={instruction} turn={responsibility} />;
+  }
+  return (
+    <div className="flex min-w-0 items-baseline gap-2 text-muted-foreground text-sm">
+      <IconClock aria-hidden className="size-4 shrink-0 translate-y-0.5" />
+      <span className="min-w-0">
+        <span className="font-medium">
+          {refused ? "Routine didn't run." : "Routine ran."}
+        </span>{" "}
+        <span className="whitespace-pre-wrap">{instruction}</span>
+      </span>
+    </div>
+  );
+}
+
+/** `manual/requested` reads as "manual"; anything else keeps its event type beside the source. */
+function describeTrigger(trigger: string): string {
+  const [source, type] = trigger.split("/", 2);
+  if (!type || type === "requested") return source ?? trigger;
+  return `${source} · ${type}`;
+}
+
+/**
+ * A responsibility's turn, drawn as the event it is.
+ *
+ * The message a responsibility sends its Bot carries the success criteria, the progress so far, the
+ * trigger, the event payload in its untrusted envelope and a reminder naming the report tool — all
+ * of it addressed to the model. Drawn inline, a person scrolling their conversation read a page of
+ * scaffolding every time the responsibility ran. So the line says what happened and what the person
+ * asked for, and the whole message sits behind "Details" for anyone checking what the Bot was told.
+ */
+function ResponsibilityFiring({
+  raw,
+  turn,
+}: {
+  raw: string;
+  turn: { instruction: string; trigger: string };
+}) {
+  return (
+    <div className="flex min-w-0 items-baseline gap-2 text-muted-foreground text-sm">
+      <IconClock aria-hidden className="size-4 shrink-0 translate-y-0.5" />
+      <div className="min-w-0">
+        <p>
+          <span className="font-medium">Worked on a goal.</span> Trigger:{" "}
+          {describeTrigger(turn.trigger)}
+        </p>
+        <p className="whitespace-pre-wrap">{turn.instruction}</p>
+        <details className="group mt-1">
+          <summary className="inline-flex cursor-pointer list-none items-center gap-1 rounded-sm text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+            Details
+            <IconChevronDown
+              aria-hidden
+              className="size-3 transition-transform group-open:rotate-180 motion-reduce:transition-none"
+            />
+          </summary>
+          <p className="mt-1 whitespace-pre-wrap break-words text-xs">{raw}</p>
+        </details>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One drawn message, and it is memoised on PRIMITIVES ON PURPOSE.
+ *
+ * A streamed answer changes `messages` on every chunk, and `toVisibleChatItems` builds fresh objects
+ * from it each time — so a memo comparing item objects would miss on every single one and buy
+ * nothing. Passing role and text means an untouched message compares equal and is skipped.
+ *
+ * MEASURED, BEFORE AND AFTER. One reply into a 25-message thread cost 76 transcript renders and
+ * 1,890 message renders, because every message in the history re-parsed its markdown on every
+ * chunk. That is the jank: the scroll was following a list that rebuilt itself 76 times.
+ *
+ * It is also what keeps the entrance honest — no remount means no replay of the fade.
+ */
+const TranscriptMessage = memo(function TranscriptMessage({
+  commandLabels = "",
+  role,
+  slackNames = NO_SLACK_NAMES,
+  streaming = false,
+  settled = true,
+  text,
+  threadId,
+  messageId,
+  underItsCard = false,
+  refused = false,
+}: {
+  commandLabels?: string;
+  role: "user" | "assistant";
+  /** The turn this message asked for was refused before it ran: a routine's says it didn't run. */
+  refused?: boolean;
+  /** A task's result drawn directly under that task's card. See `reportsUnderTheirCards`. */
+  underItsCard?: boolean;
+  /** The people and channels this conversation's Slack steps named, for mentions in the reply. */
+  slackNames?: SlackNames;
+  threadId?: string;
+  messageId: string;
+  /* This is the Bot's reply still being written: the last row of a turn in flight. */
+  streaming?: boolean;
+  settled?: boolean;
+  text: string;
+}) {
+  const isUser = role === "user";
+  const live = useArrivedLive();
+  const [mode] = useState(() => messageMode(live, streaming));
+  // A person's message arrives whole; only a Bot's reply is paced.
+  const revealed = usePacedReveal(text, {
+    live: live && !isUser,
+    streaming,
+  });
+  /*
+   * Checked before anything else a person's message gets. A firing is not a person's message: the
+   * chip split, the end alignment and the bubble are all wrong for it, and each one of them would
+   * have to learn about firings separately if this branched any later.
+   */
+  const resultRef = useResultVisibility(
+    threadId ? { threadId, messageId } : undefined,
+    !isUser && settled && revealed.trim().length > 0,
+  );
+  const firing = isUser ? readFiring(text) : null;
+  /*
+   * A task thread's first message is the Bot's brief, not something the person typed: drawn as sent
+   * from the Bot, without the words that frame it for the model. See `frameBrief`.
+   */
+  const brief = isUser ? readBrief(text) : null;
+  if (brief !== null) {
+    return (
+      <MessageRow align="end">
+        <MessageContent>
+          <Arriving>
+            <SentFromBot brief={brief} threadId={threadId} />
+          </Arriving>
+        </MessageContent>
+      </MessageRow>
+    );
+  }
+  if (firing !== null) {
+    return (
+      <MessageRow align="start">
+        <MessageContent>
+          <Arriving>
+            <RoutineFiring instruction={firing} refused={refused} />
+          </Arriving>
+        </MessageContent>
+      </MessageRow>
+    );
+  }
+  const align = isUser ? "end" : "start";
+  // Slack/Teams turns carry a model-facing participant line; show a marker instead of the line.
+  const origin = isUser ? splitChatOrigin(text) : null;
+  const said = origin ? origin.text : text;
+  const invoked = isUser ? splitSkillChip(said, commandLabels) : null;
+  /*
+   * Another Bot's answer, asked for by this one: drawn under that Bot's face and name, as a group
+   * conversation draws each Bot, so it reads as the Bot that was asked speaking rather than as this
+   * Bot saying something new. The id is what says whose it is; see `answerMessageId`.
+   */
+  const answerer = isUser ? null : answeredBy(messageId);
+  const report = isUser ? null : readTaskReport(messageId);
+  /*
+   * What the person told a task in its own thread, written here so the Bot knows of it. The person
+   * reads it on the line under the task's card, once, so the transcript draws no message for it.
+   */
+  if (report?.kind === "steer") return <SteerLanded taskId={report.taskId} />;
+
+  return (
+    <MessageRow
+      align={align}
+      {...(answerer ? { "data-speaker": answerer } : {})}
+    >
+      {answerer ? (
+        <div className="shrink-0 pt-0.5">
+          <ChannelAvatar participantIds={[answerer]} size={24} />
+        </div>
+      ) : null}
+      <MessageContent>
+        <Arriving>
+          {answerer ? <AnswererName botId={answerer} /> : null}
+          {/*
+            A Bot's message takes the whole column, not the width of its words: block content
+            inside it — a fenced code block, a table — should span the transcript rather than
+            shrink to its own text. A person's bubble keeps fitting what they said.
+          */}
+          <Bubble
+            align={align}
+            variant={isUser ? "muted" : "ghost"}
+            className={isUser ? undefined : "w-full"}
+          >
+            <BubbleContent
+              className={cn("text-[1rem]/[1.5]", !isUser && "w-full")}
+            >
+              {isUser ? (
+                // A person's own message is shown exactly as they typed it. Rendering it as markdown
+                // would silently reformat what they said, and an asterisk in a sentence is not
+                // emphasis. The chip is the one exception, and it is not reformatting: it is drawing
+                // the thing that was already a chip in the composer as a chip here too, so the
+                // transcript shows a skill was used rather than a slash that was typed.
+                <span className="whitespace-pre-wrap">
+                  {origin && (
+                    <span className="mr-1.5 inline-flex items-center rounded bg-foreground/10 px-1.5 py-0.5 align-middle text-foreground/70 text-xs">
+                      via {origin.via}
+                    </span>
+                  )}
+                  {invoked ? (
+                    <>
+                      {/*
+                       * The same icon the sidebar uses for Skills, so the badge says WHAT KIND of
+                       * thing was invoked before it says which one. `inline-flex` with
+                       * `align-middle` rather than a block: this sits mid-sentence, and a badge that
+                       * breaks the line it is in reads as a separate message.
+                       */}
+                      <span className="mr-1 inline-flex items-center gap-1 rounded bg-foreground/10 px-1.5 py-0.5 align-middle text-foreground/80 text-xs">
+                        <IconBox className="size-3 shrink-0" />
+                        {invoked.chip}
+                      </span>
+                      {invoked.rest}
+                    </>
+                  ) : (
+                    said
+                  )}
+                </span>
+              ) : (
+                /*
+                 * A Bot's prose is markdown, and it arrives in pieces.
+                 *
+                 * Rendered with a streaming-aware renderer rather than an ordinary one: half a fenced
+                 * code block or an unclosed bold marker is the NORMAL state for most of a run, and a
+                 * plain markdown parser draws that as literal asterisks and backticks until the
+                 * closing token arrives, so the answer visibly rewrites itself as it lands. This
+                 * closes them for the duration.
+                 */
+                <div ref={resultRef}>
+                  {report ? (
+                    /*
+                     * A task the Bot handed out, saying how it went: its words, framed with the
+                     * task they are about and the way into its thread. See `taskReportMessageId`.
+                     */
+                    <TaskReport
+                      kind={report.kind}
+                      taskId={report.taskId}
+                      underCard={underItsCard}
+                      words={text}
+                    >
+                      <BotMarkdown
+                        components={markdownComponents}
+                        mode={mode}
+                        plugins={markdownPlugins}
+                        remarkPlugins={replyRemarkPluginsFor(slackNames)}
+                      >
+                        {revealed}
+                      </BotMarkdown>
+                    </TaskReport>
+                  ) : (
+                    <BotMarkdown
+                      components={markdownComponents}
+                      mode={mode}
+                      plugins={markdownPlugins}
+                      remarkPlugins={replyRemarkPluginsFor(slackNames)}
+                    >
+                      {revealed}
+                    </BotMarkdown>
+                  )}
+                </div>
+              )}
+            </BubbleContent>
+          </Bubble>
+          {isUser && threadId ? (
+            <MessageReactions messageId={messageId} threadId={threadId} />
+          ) : null}
+        </Arriving>
+      </MessageContent>
+    </MessageRow>
+  );
+});
+
+/** Whose answer this is, by the name the person knows the Bot by. */
+function AnswererName({ botId }: { botId: string }) {
+  const { data: bots } = useQuery(agentListQueryOptions());
+  // Nothing until the roster arrives, rather than a placeholder that is replaced a moment later.
+  if (!bots) return null;
+  return (
+    <MessageHeader className="text-xs font-medium text-muted-foreground">
+      {bots.find((bot) => bot.id === botId)?.name ?? "A Bot no longer here"}
+    </MessageHeader>
+  );
+}
+
+/**
+ * The one shape an attachment url is allowed to have, taken from the helper that builds it rather
+ * than written out again, so the check cannot drift from the route that serves the file.
+ */
+const ATTACHMENT_URL_PREFIX = attachmentUrl("");
+
+/**
+ * THE FILES A PERSON ATTACHED TO ONE TURN, drawn as a row where their own message would be.
+ *
+ * ALWAYS THE PERSON'S OWN, so it aligns end like their bubble does — `toVisibleChatItems` only ever
+ * produces this kind from a user turn's content, and there is no assistant equivalent to confuse it
+ * with. `justify-end` is what actually puts a short row against the right edge; `align="end"` gets
+ * the row there, not the tiles inside it.
+ *
+ * SQUARE, AND ALL THE SAME SIZE. Three photos of different shapes drawn at their own aspect ratios
+ * make a ragged row whose only signal is which camera took what, and a single tall screenshot drawn
+ * at its own aspect pushed the rest of the turn off the screen. A grid of equal tiles says "three
+ * files" at a glance, which is the thing worth saying here; the picture itself is one click away.
+ */
+type AttachmentRowProps = {
+  attachments: readonly SentAttachment[];
+};
+
+/**
+ * Whether two renders of this row are the same row, compared BY VALUE because identity says no
+ * every time.
+ *
+ * `toVisibleChatItems` runs on every render of the transcript — deliberately, and the comment on
+ * that call says why: the agent hands back the same array and mutates it, so a `useMemo` over it
+ * never invalidates and a reply never appears. The price is that `attachments` is a fresh array of
+ * fresh objects on every chunk of a streaming answer, and `memo`'s default `Object.is` on two
+ * different arrays is false however identical they are. So this memo missed EVERY time, and every
+ * tile in a channel's history — each one carrying an image `Dialog` — re-rendered on every token
+ * of an answer being typed further down. The memoised message rows above it were paying for this
+ * one's misses.
+ *
+ * Field by field, because the fields are what the tiles draw: a row whose files have the same ids,
+ * urls, names and kinds in the same order draws exactly the same pixels.
+ *
+ * Exported so it can be checked without mounting anything, the same reason `isPersonSentMessage`
+ * is.
+ */
+export function sameAttachmentRow(
+  previous: AttachmentRowProps,
+  next: AttachmentRowProps,
+): boolean {
+  if (previous.attachments.length !== next.attachments.length) {
+    return false;
+  }
+
+  return previous.attachments.every((attachment, index) => {
+    const other = next.attachments[index];
+    return (
+      other !== undefined &&
+      attachment.id === other.id &&
+      attachment.attachmentId === other.attachmentId &&
+      attachment.url === other.url &&
+      attachment.filename === other.filename &&
+      attachment.modality === other.modality
+    );
+  });
+}
+
+export const TranscriptAttachments = memo(function TranscriptAttachments({
+  attachments,
+}: AttachmentRowProps) {
+  return (
+    <MessageRow align="end">
+      <MessageContent>
+        <Arriving>
+          <AttachmentTiles attachments={attachments} />
+        </Arriving>
+      </MessageContent>
+    </MessageRow>
+  );
+}, sameAttachmentRow);
+
+/**
+ * The tiles themselves, as one row.
+ *
+ * Its own component because the QUEUE draws this row too, faded, for a message parked mid-turn —
+ * and two copies of a list of tiles is two places for the alignment below to be got right.
+ *
+ * `self-end` because `align="end"` does not reach this far on its own: both callers put this
+ * inside a `flex w-full flex-col` — `Arriving` for a sent turn, `MessageContent` for a parked one —
+ * so a block child stretches to the transcript's full width and its contents draw hard against the
+ * LEFT edge, under the person's own right-aligned bubble, reading as though the Bot had sent them.
+ * `Bubble` escapes this because it carries its own `group-data-[align=end]/message:self-end`.
+ */
+function AttachmentTiles({
+  attachments,
+  className,
+}: {
+  attachments: readonly SentAttachment[];
+  className?: string;
+}) {
+  return (
+    <ul
+      className={cn(
+        "flex w-fit flex-wrap items-start justify-end gap-2 self-end",
+        className,
+      )}
+    >
+      {attachments.map((attachment) => (
+        <li key={attachment.id}>
+          <SentAttachmentTile attachment={attachment} />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * One tile in that row, and all three shapes are the same size on purpose.
+ *
+ * A document used to draw as a `ToolLine`, which was the right call while an attachment was a row
+ * of its own: that component is one line for one thing a Bot did, and a filename beside a label is
+ * exactly that shape. It is the wrong thing inside a ROW. `ToolLine` has no width of its own, so
+ * two documents and a photo came out as a pair of bare sentences stretched across the empty half of
+ * the line with the picture stranded at the end — the same tiles, laid out as if they were prose.
+ *
+ * So a document gets a card the height of a thumbnail instead. What the row is saying is "these
+ * files came with this message", and it can only say it if every tile in it reads as a file.
+ *
+ * A BROKEN-IMAGE GLYPH SAYS NOTHING TO THE READER — the browser's placeholder tells them a box
+ * failed to load, not that a file is gone. `onError` catches that and swaps it for a sentence in the
+ * file's own name, in the same destructive vocabulary `Stopped` already uses for "the thing that was
+ * supposed to be here isn't." It borrows the LOOK and not the urgency: see the missing tile below
+ * for why the same absence is a note here and an alert there.
+ */
+function SentAttachmentTile({ attachment }: { attachment: SentAttachment }) {
+  const [failedToLoad, setFailedToLoad] = useState(false);
+  const { filename, modality, url } = attachment;
+  /*
+   * An off-site url is treated as a missing file, whatever kind of file it says it is.
+   *
+   * `toVisibleChatItems` passes on whatever a `url` source carried, and nothing between here and
+   * the wire narrows it. A sent message only ever carries the relative form — `shared/attachments.ts`
+   * says the url "is never fetched by a provider", and `copilot.ts` swaps the source for the bytes
+   * as the run is built — so an absolute url arriving here did not come from this app's composer,
+   * and putting it in `src` would have the reader's browser fetch a third party the instant the
+   * transcript drew, announcing to whoever owns it that this person opened this channel.
+   */
+  const servable = url.startsWith(ATTACHMENT_URL_PREFIX);
+  // Where the bytes are read from: the API's address for the attachment the message names.
+  const address = servable ? attachmentAddress(url) : url;
+  /*
+   * ONLY OURS IS EVER ASKED ABOUT, and that is the same rule as the line above rather than a second
+   * one: a probe is a request like any other, so asking a third party whether a file is still there
+   * announces the reader exactly as fetching it would. An off-site url is already unavailable
+   * without anybody being asked.
+   */
+  const gone = useDocumentIsGone(address, servable && modality === "document");
+  /*
+   * A PICTURE THAT WOULD NOT DRAW IS ASKED ABOUT, NOT DECLARED GONE. Its own load failing says this
+   * browser could not draw it; only the server can say the file is gone. A picture up to 100MB can
+   * be intact and still not draw on a phone, and this tile used to say, in the file's own name, that
+   * it was unavailable. Now a 404 says that, and anything else draws the file tile below.
+   */
+  const facts = useFileFacts(address, servable && failedToLoad);
+  const unavailable = facts?.missing === true || gone || !servable;
+
+  /*
+   * ABSENCE IS DECIDED BEFORE MODALITY IS, and that ordering is the whole point of this block
+   * sitting above the document card rather than below it. A document whose url is not ours to
+   * serve, or whose row `useDocumentIsGone` found deleted, drew as an intact card naming a file
+   * that is not there. A missing picture at least looked missing; a missing document looked
+   * present. Whether the file can be shown at all is the first question either kind asks.
+   */
+  if (unavailable) {
+    return (
+      /*
+       * `note`, NOT `alert`, AND THE DIFFERENCE IS WHO IS INTERRUPTED. An alert is an assertive
+       * live region: it cuts across whatever a screen reader is saying the moment it appears. That
+       * is right for `Stopped`, which reports something that just happened in answer to what
+       * somebody did, and wrong for every one of these — a transcript with three deleted files
+       * fired three interruptions on mount, before the reader had heard a word of the conversation,
+       * to report absences that predate their opening the channel.
+       *
+       * `note` is not a live region at all, so nothing is announced over anything; it still marks
+       * the tile as a thing to stop on, and the sentence inside it — unchanged, in the file's own
+       * name — is what says the file is gone when the reader reaches it.
+       */
+      <div
+        className="flex h-32 w-44 flex-col justify-center gap-2 rounded-xl border border-destructive border-dashed p-3 text-destructive"
+        role="note"
+      >
+        <IconAlertTriangle className="size-6" />
+        <p className="text-sm">{unavailableSentence(filename)}</p>
+      </div>
+    );
+  }
+
+  /*
+   * A DOCUMENT SAYS WHAT IT IS, WHEN THE MESSAGE CARRIES THE TYPE THE SERVER FOUND: its own icon and
+   * its kind and size ("Excel workbook · 14 KB"), the same words a Bot's file card uses, and a
+   * Download for the file itself. A message that carries no type (one sent before types were) draws
+   * as it always did, a file icon and "Attachment".
+   */
+  if (modality === "document") {
+    const name = filename ?? "Untitled file";
+    const kind = attachment.mimeType
+      ? kindLabel(attachment.mimeType, name)
+      : undefined;
+    return (
+      <div className="flex h-32 w-44 flex-col justify-between rounded-xl border border-border bg-muted/40 p-3">
+        <div className="flex items-start justify-between gap-2">
+          <FileTypeIcon
+            className="size-6 text-muted-foreground"
+            mimeType={attachment.mimeType}
+          />
+          <Button
+            aria-label={`Download ${name}`}
+            nativeButton={false}
+            render={<a download={name} href={address} />}
+            size="icon-sm"
+            variant="outline"
+          >
+            <IconDownload />
+          </Button>
+        </div>
+        <div className="min-w-0">
+          {/* `title` because the tile is fixed-width and a long name is cut, not wrapped. */}
+          <p className="truncate font-medium text-sm" title={filename}>
+            {name}
+          </p>
+          {/*
+           * Two lines at most, never cut: "PowerPoint presentation · 29 KB" is wider than the tile,
+           * and an ellipsis took the size off. See {@link kindAndSize} for where it may wrap.
+           */}
+          <p className="line-clamp-2 text-muted-foreground text-xs">
+            {kind === undefined
+              ? "Attachment"
+              : kindAndSize(kind, attachment.sizeBytes)}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (failedToLoad) {
+    return (
+      <PictureFileTile address={address} facts={facts} filename={filename} />
+    );
+  }
+
+  /*
+   * A PICTURE OVER 8MB IS SHOWN AS ITS FILE, NOT DOWNLOADED FOR A THUMBNAIL. A thumbnail is drawn
+   * from the whole file, pictures go up to 100MB, and every reader would pay that on first paint
+   * while the download held up the conversation's other requests. Its name, kind and size are on the
+   * message, so nothing is fetched until somebody opens it. A message from before sizes were sent
+   * carries none, and every picture sent then was 8MB at most, so it draws as it always did.
+   */
+  if (
+    attachment.sizeBytes !== undefined &&
+    attachment.sizeBytes > LARGEST_PICTURE_DRAWN_INLINE
+  ) {
+    return (
+      <PictureFileTile
+        address={address}
+        facts={{
+          sizeBytes: attachment.sizeBytes,
+          ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
+        }}
+        filename={filename}
+        openable
+      />
+    );
+  }
+
+  return (
+    <AttachmentLightbox filename={filename} url={address}>
+      <img
+        alt={filename ? `Attachment: ${filename}` : "Attachment"}
+        className="size-32 rounded-xl object-cover"
+        onError={() => setFailedToLoad(true)}
+        src={address}
+      />
+    </AttachmentLightbox>
+  );
+}
+
+/**
+ * A file's kind and size for a narrow tile ("PowerPoint presentation · 29 KB"), joined so a line can
+ * break only between the kind's words: the kind's last word, the dot and the size stay together, and
+ * a long kind wraps to "PowerPoint" over "presentation · 29 KB" instead of losing the size.
+ */
+function kindAndSize(kind: string, sizeBytes: number | undefined): string {
+  if (sizeBytes === undefined) return kind;
+  const words = kind.split(" ");
+  const last = words.pop() ?? "";
+  const tail = [last, "·", ...fileSize(sizeBytes).split(" ")].join("\u00a0");
+  return [...words, tail].join(" ");
+}
+
+/**
+ * A picture this browser could not draw, as the file it is: the same card a document gets, with
+ * the kind and size the server gave and a Download for the file itself.
+ *
+ * Drawn from the moment the picture fails, before the server has answered, with "Image" until the
+ * answer brings the kind and size: a blank or a broken box is never shown in between.
+ */
+function PictureFileTile({
+  address,
+  facts,
+  filename,
+  openable = false,
+}: {
+  address: string;
+  facts: { sizeBytes?: number; mimeType?: string } | undefined;
+  filename?: string;
+  /** An Open beside the Download, for a picture that can be drawn but is too large to draw here. */
+  openable?: boolean;
+}) {
+  const name = filename ?? "Untitled file";
+  const kind = facts?.mimeType ? kindLabel(facts.mimeType, name) : "Image";
+  return (
+    <div className="flex h-32 w-44 flex-col justify-between rounded-xl border border-border bg-muted/40 p-3">
+      <div className="flex items-start justify-between gap-2">
+        <IconPhoto aria-hidden className="size-6 text-muted-foreground" />
+        <div className="flex gap-1">
+          {openable ? (
+            <AttachmentLightbox
+              filename={name}
+              trigger={
+                <Button
+                  aria-label={`Open ${name}`}
+                  size="icon-sm"
+                  variant="outline"
+                />
+              }
+              url={address}
+            >
+              <IconArrowsMaximize />
+            </AttachmentLightbox>
+          ) : null}
+          <Button
+            aria-label={`Download ${name}`}
+            nativeButton={false}
+            render={<a download={name} href={address} />}
+            size="icon-sm"
+            variant="outline"
+          >
+            <IconDownload />
+          </Button>
+        </div>
+      </div>
+      <div className="min-w-0">
+        {/* `title` because the tile is fixed-width and a long name is cut, not wrapped. */}
+        <p className="truncate font-medium text-sm" title={name}>
+          {name}
+        </p>
+        <p className="truncate text-muted-foreground text-xs">
+          {facts?.sizeBytes === undefined
+            ? kind
+            : `${kind} · ${fileSize(facts.sizeBytes)}`}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * What a failed activity is called on screen.
+ *
+ * An `activityType` is a protocol name and reads like one, so the boundary's sentence gets a phrase
+ * a person can read instead. An unknown type falls back to its own name rather than to something
+ * vague: whoever registered it will recognise it, and nobody else can act on either wording.
+ */
+function activityName(activityType: string): string {
+  return activityType === "open-generative-ui"
+    ? "This Bot's generated interface"
+    : activityType;
+}
+
+/**
+ * One activity, drawn by whichever renderer claims its type.
+ *
+ * The renderer comes from the SDK's registry, so an activity nobody registered draws nothing and
+ * this returns null rather than an empty row — unlike a tool call, which always has a line to fall
+ * back to because a call that happened is worth reporting even undrawn. An activity is the drawing;
+ * with no renderer there is nothing to say about it.
+ *
+ * The memo boundary earns its place differently here than on a tool call. It cannot spare this
+ * component its own churn — a generated interface streams, and `content` is a new object on every
+ * chunk, which is exactly when it must re-render — but it does stop the sentence being typed after it
+ * from re-rendering a mounted iframe.
+ */
+const TranscriptActivity = memo(function TranscriptActivity({
+  message,
+}: {
+  message: ActivityMessage;
+}) {
+  const { renderActivityMessage } = useRenderActivityMessage();
+  /*
+   * Drawn before generative UI was switched on (a cold load: the capabilities answer or the runtime
+   * connection still on its way), an activity found no renderer. Read so it redraws when the
+   * renderers arrive, rather than staying blank until its own message next changes; see
+   * `LateRenderersWatch`, which the transcript mounts once for all of them.
+   */
+  useContext(LateRenderersContext);
+  const call =
+    message.activityType === VOICE_CHAT_ACTIVITY
+      ? (message.content.call as VoiceChatEntry)
+      : null;
+  const drawn = call ? (
+    <VoiceChatCard call={call} />
+  ) : (
+    renderActivityMessage(message)
+  );
+  if (!drawn) return null;
+
+  return (
+    <Arriving happenedAt={call?.startedAt}>
+      <ToolRenderBoundary name={activityName(message.activityType)}>
+        {drawn}
+      </ToolRenderBoundary>
+    </Arriving>
+  );
+});
+
+/**
+ * One drawn tool call, memoised on the same terms.
+ *
+ * The `toolCall` object is rebuilt here from its parts rather than passed down, because the one on
+ * the message is a new object on every chunk and would defeat the memo exactly as the text items
+ * did. A finished chart re-rendering on every token of the sentence after it is not free.
+ *
+ * `useRenderToolCall` is called HERE rather than passed in as a prop: a function whose identity the
+ * parent cannot guarantee is the classic way to make a memo boundary useless.
+ */
+const ToolCallBody = memo(function ToolCallBody({
+  toolCallId,
+  name,
+  args,
+  result,
+  latest,
+  spokeAfter,
+}: {
+  toolCallId: string;
+  name: string;
+  args: string;
+  result?: string;
+  /** Nothing said or queued since this call, and the Bot is not working. See `CardPlace`. */
+  latest: boolean;
+  /** The Bot said something after this call in its turn. See `ToolPlace`. */
+  spokeAfter: boolean;
+}) {
+  const renderToolCall = useRenderToolCall();
+  const toolCall = useMemo(
+    () => ({
+      id: toolCallId,
+      type: "function" as const,
+      function: { name, arguments: args },
+    }),
+    [toolCallId, name, args],
+  );
+
+  // Another harness's tool under one of Claude Code's names is drawn as any other tool is.
+  const drawn = foreignCodingCall(name, args)
+    ? null
+    : renderToolCall({
+        toolCall,
+        ...(result === undefined
+          ? {}
+          : {
+              toolMessage: {
+                id: `${toolCallId}-result`,
+                role: "tool",
+                toolCallId,
+                content: result,
+              },
+            }),
+      });
+
+  const place = useMemo(
+    () => ({ toolCallId, latest, spokeAfter }),
+    [toolCallId, latest, spokeAfter],
+  );
+
+  return (
+    <ToolRenderBoundary
+      final={toolCallFinal(args, result)}
+      name={name}
+      resetKey={args}
+    >
+      <ToolPlaceContext.Provider value={place}>
+        {/*
+         * A TOOL WITH NO REGISTERED RENDERER STILL HAPPENED, and since tools moved to the server
+         * that is now the ordinary case rather than the exception: MCP tools execute in the runtime
+         * and register no renderer here at all. `renderToolCall` still draws the components the app
+         * registers, and everything else lands below.
+         *
+         * What was called, shimmering until its result arrives, and then the server's own words
+         * drawn the way a Bot's prose is drawn.
+         *
+         * WHILE OPENBOT ASKS ABOUT IT, ITS CARD IS DRAWN HERE INSTEAD. The server stops the turn and
+         * opens a request for the person, and this line would otherwise shimmer with no way to
+         * answer it but the Bots page. The same card a computer step draws (see `approval-tools`),
+         * read from the same inbox, and the line comes back once it is decided.
+         */}
+        {drawn ?? (
+          <InlineApproval
+            toolCallId={toolCallId}
+            fallback={
+              // OpenBot settings' tools draw their own cards (components/settings-tools).
+              settingsToolCardFor(name) ? (
+                <SettingsToolCall args={args} name={name} result={result} />
+              ) : (
+                <ServerToolLine
+                  args={args}
+                  name={name}
+                  place={{ toolCallId, latest }}
+                  result={result}
+                />
+              )
+            }
+          />
+        )}
+      </ToolPlaceContext.Provider>
+    </ToolRenderBoundary>
+  );
+});
+
+/**
+ * A row of tool calls, drawn by ONE component whatever it holds, so a row is never rebuilt as its
+ * calls change. A lone call is the line or card it always was; a run, or a browser step, is the
+ * folded group. Both a `tools` group and a single `tool` item come through here, because a lone call
+ * can be either over its life (it stops folding once its answer asks the person) under one key; see
+ * `groupToolSteps`.
+ */
+type ToolRowProps = {
+  id: string;
+  steps: ToolGroup["steps"];
+  active: boolean;
+  /** The row's turn is still running. See `TurnInFlightContext`. */
+  inFlight: boolean;
+  latest: boolean;
+  /** The Bot said something after this row in its turn. See `ToolPlace`. */
+  spokeAfter: boolean;
+};
+
+/**
+ * Whether a tool row would draw the same thing. `groupToolSteps` builds new step objects and a new
+ * array on every render (it has to: the agent mutates the messages in place), so the default memo
+ * check saw a change on every token of a reply streaming below and redrew every finished tool group
+ * in the history, markdown inside collapsed details included. What a row draws is its steps' calls
+ * and results, and those are what is compared. Exported for its test.
+ */
+export function sameToolRow(a: ToolRowProps, b: ToolRowProps): boolean {
+  return (
+    a.id === b.id &&
+    a.active === b.active &&
+    a.inFlight === b.inFlight &&
+    a.latest === b.latest &&
+    a.spokeAfter === b.spokeAfter &&
+    a.steps.length === b.steps.length &&
+    a.steps.every((step, index) => {
+      const other = b.steps[index];
+      return (
+        other !== undefined &&
+        step.id === other.id &&
+        step.result === other.result &&
+        step.toolCall.function.name === other.toolCall.function.name &&
+        step.toolCall.function.arguments === other.toolCall.function.arguments
+      );
+    })
+  );
+}
+
+const ToolRow = memo(function ToolRow({
+  id,
+  steps,
+  active,
+  inFlight,
+  latest,
+  spokeAfter,
+}: ToolRowProps) {
+  const [only] = steps;
+  return (
+    <TurnInFlightContext.Provider value={inFlight}>
+      <Arriving>
+        {steps.length === 1 &&
+        only &&
+        !isBrowserStep(only) &&
+        // A subtask is drawn as work even alone, so a second call joining it does not change its shape.
+        only.toolCall.function.name !== SUBAGENT_TOOL ? (
+          <ArgumentsArrivingContext.Provider value={active}>
+            <ToolCallBody
+              args={only.toolCall.function.arguments}
+              latest={latest}
+              name={only.toolCall.function.name}
+              result={only.result}
+              spokeAfter={spokeAfter}
+              toolCallId={only.toolCall.id}
+            />
+          </ArgumentsArrivingContext.Provider>
+        ) : (
+          <ToolActivity active={active} group={{ kind: "tools", id, steps }} />
+        )}
+      </Arriving>
+    </TurnInFlightContext.Provider>
+  );
+}, sameToolRow);
+
+/**
+ * A tool the runtime executed, drawn for the person watching.
+ *
+ * Named from the reader's side: what was done, against which server, with the server's own words
+ * behind a disclosure. The identifier the model was offered never reaches the screen.
+ *
+ * Exported for its tests, which draw it without the CopilotKit provider `ToolCallBody` needs.
+ */
+export function ServerToolLine({
+  name,
+  args,
+  result,
+  place,
+}: {
+  name: string;
+  /** What the call was given, as the model wrote it. Read only for what a step acted on. */
+  args?: string;
+  result?: string;
+  /** Where this call sits in the conversation, for an app card that may carry the task on. */
+  place?: CardPlace;
+}) {
+  const running = result === undefined;
+  // Cut off with its outcome unknown: named as it is while under way, since nobody knows it was done.
+  const interrupted = cutOffStep(result);
+  const named = readToolName(name, running || interrupted);
+  const folders = useContext(FolderNamesContext);
+  // The file a file step read or saved, as a computer's own file steps name it; a step on a folder
+  // on the person's computer names the folder too ("todo.txt in share").
+  const detail =
+    named.detail ??
+    folderStepSubject(name, args, folders) ??
+    ownToolSubject(name, args);
+  /*
+   * A refusal is not a result, and must not read like one.
+   *
+   * The server says which it is rather than the browser inferring it from the wording, because the
+   * wording is a policy message an administrator can rewrite and the first rephrasing would break
+   * any guess made here. See REFUSAL_MARKER in server/src/plugins/tools.ts.
+   */
+  const answer = result === undefined ? undefined : asText(result);
+  // Behind the marker, or a step the person declined on the conversation's card. See `refusalOf`.
+  const reason = refusalOf(answer);
+  const refused = reason !== undefined;
+  // Asked for a tool it was never offered: it didn't work, and what the runtime said was for the model.
+  const unoffered = unofferedTool(result);
+  const failed =
+    !refused && !interrupted && (unoffered || toolResultFailed(result));
+  const role = researchRoleOfCall(name);
+  /*
+   * A search with its results in reads as done. A research step is named for what it does ("Search
+   * the web"), which on a line of its own, finished, read as a search still going on; folded with
+   * other steps it has always read "Searched the web".
+   */
+  const label =
+    role === "search" && !running && !interrupted && !refused && !failed
+      ? "Searched the web"
+      : named.label;
+  /*
+   * The marker is for this component, not for the reader. Left in, a refusal reads "Blocked" in the
+   * label and then "Refused." again in the first two words of the body, which is the same fact three
+   * times over by the end of the sentence. Stripped here rather than on the server, because the
+   * server's copy is what the model is told and "Refused." in front of a reason is right for it.
+   */
+  const body = refused ? reason : answer;
+  // A Team Bot asking to use this person's own account draws its consent card, not the sentence.
+  const consent = refused ? readTeamBotConsent(body) : null;
+  if (consent) return <TeamBotConsentCard {...consent} />;
+  /*
+   * An app this call could not use draws a card with the step that fixes it, not the name of a
+   * screen: a refusal carrying the marker, or the answer of the one tool whose whole job is to put
+   * that card on screen. Only that tool's ordinary answer is read for a marker — any other result
+   * is somebody else's text, and a card must not be conjured out of it.
+   */
+  const card = refused
+    ? readConnectPrompt(body)
+    : name === SHOW_APP_ACCESS_TOOL
+      ? readConnectPrompt(answer)
+      : null;
+  if (card) return <AppAccessCard place={place} prompt={card} />;
+  /*
+   * THAT TOOL'S OTHER ANSWERS ARE FOR THE MODEL. An app nobody can name comes back as plain text
+   * telling the Bot to say so plainly and not to browse to it — an instruction, which read by the
+   * person looks like the Bot being told off in front of them. The line still says the check
+   * happened; the Bot's own reply says what it found.
+   */
+  /*
+   * A folder step that did not happen says which file and why on its line, as a step on the Bot's
+   * own computer does ("Blocked: Save a file  notes.txt · You declined it."), and the reason is said
+   * in the person's words, not the sentence written for the Bot.
+   */
+  const folderRefusal =
+    refused && name.startsWith("host_")
+      ? [detail, outcomeForPerson(reason ?? "")].filter(Boolean).join(" · ")
+      : undefined;
+  const shown =
+    name === SHOW_APP_ACCESS_TOOL || folderRefusal !== undefined
+      ? undefined
+      : interrupted
+        ? // What the Bot was told is for the Bot. The person is told what happened.
+          CUT_OFF_SENTENCE
+        : unoffered
+          ? UNOFFERED_TOOL_SENTENCE
+          : refused && body
+            ? outcomeForPerson(body)
+            : answersTheModel(name)
+              ? // Written for the model. A tool search opens to the tools it found, in words.
+                name === SEARCH_TOOLS
+                ? foundToolsInWords(answer)
+                : undefined
+              : // A folder step's answer for the model (JSON, grant ids) is said in words or left out.
+                folderStepBody(name, body);
+  /*
+   * A web search or a page read opens to the pages it found, not to the provider's JSON. The list
+   * bounds itself (a few results, each cut to a few lines), so the line does not scroll around it.
+   */
+  const sources =
+    role && shown && !refused && !failed && !interrupted
+      ? readResearchSources(shown)
+      : null;
+  if (role && sources)
+    return (
+      <ToolLine
+        {...(detail ? { detail } : {})}
+        bare
+        label={label}
+        running={running}
+      >
+        <ResearchResults
+          label={RESEARCH_RESULTS_LABELS[role]}
+          sources={sources}
+        />
+      </ToolLine>
+    );
+  return (
+    <ToolLine
+      {...((folderRefusal ?? detail)
+        ? { detail: folderRefusal ?? detail }
+        : {})}
+      // A blocked step did not happen: "Blocked: Save a file", never "Blocked: Saved a file".
+      {...(refused ? { attempted: ownToolAttempt(name) ?? undefined } : {})}
+      label={label}
+      refused={refused}
+      failed={failed}
+      interrupted={interrupted}
+      running={running}
+    >
+      {shown ? (
+        <BotMarkdown components={markdownComponents} plugins={markdownPlugins}>
+          {forDisplay(shown)}
+        </BotMarkdown>
+      ) : null}
+    </ToolLine>
+  );
+}
+
+/**
+ * The tools a search found, one to a line by the name a step gives each ("Send email on Gmail"). The
+ * search answers the model, naming each tool by the id it is offered under
+ * (`mcp__composio-gmail__GMAIL_SEND_EMAIL`), and the step opened to that answer as it was.
+ */
+function foundToolsInWords(answer: string | undefined): string | undefined {
+  const names = answer ? toolsFound(answer) : [];
+  if (names.length === 0) return undefined;
+  return names
+    .map((name) => {
+      const { label, detail } = readToolName(name);
+      return `- ${detail ? `${label} on ${detail}` : label}`;
+    })
+    .join("\n");
+}
+
+/*
+ * Moved beside the turns it also decides; re-exported for the callers that read it from here. And
+ * the lightbox's picture, now in attachment-view.tsx, where the transcript's tests import it from.
+ */
+export { isPersonSentMessage, LightboxPicture };
+
+/**
+ * WHERE THE CONVERSATION HAS GOT TO, for an app card that may carry its task on once the app is
+ * ready (see `lib/copilot/carry-on.ts`): the index from which a row is still the latest thing, or
+ * past the end when none is.
+ *
+ * A card is the latest thing while nothing has been said to the Bot since it, nothing is queued, and
+ * the Bot is not working: past that, the conversation has moved on, and an older task is not picked
+ * up again underneath it. ANY USER TURN COUNTS, a routine firing included — unlike the scroll
+ * machinery's `isPersonSentMessage`. A firing is not the person speaking, but it is a new task the
+ * Bot has answered, and "please carry on" sent after it would land on the routine's work rather than
+ * on the task the card interrupted. Exported so it can be checked without mounting anything.
+ */
+export function latestFrom(
+  items: readonly TranscriptItem[],
+  { busy, queued }: { busy: boolean; queued: number },
+): number {
+  if (busy || queued > 0) return items.length;
+  return (
+    items.findLastIndex(
+      (item) =>
+        (item.kind === "text" && item.role === "user") ||
+        item.kind === "attachments",
+    ) + 1
+  );
+}
+
+/**
+ * The turn a row belongs to.
+ *
+ * The attachments row is identified as `${messageId}:attachments` by `toVisibleChatItems`, so that
+ * it and the caption beneath it can be told apart while still belonging to one turn. The id of the
+ * message they were sent in is the part before the last colon.
+ */
+function turnOf(item: TranscriptItem): string {
+  if (item.kind !== "attachments") {
+    return item.id;
+  }
+  const separator = item.id.lastIndexOf(":");
+  return separator === -1 ? item.id : item.id.slice(0, separator);
+}
+
+/**
+ * Which rows the scroller may lift to the top of the viewport: THE FIRST ROW OF EACH TURN THE
+ * PERSON SENT, and only that one.
+ *
+ * The scroller reads `data-scroll-anchor` off the rows appended in one go, takes the first it finds
+ * and scrolls it to the top with a peek of the answer above it — but finding MORE THAN ONE among
+ * that same batch it gives up on the ambiguity and jumps to the end instead. One turn is very often
+ * several rows: a caption and its screenshot, or three files pasted together, all arrive at once.
+ * So "every row a person sent" is not the rule; "the first row of every turn a person sent" is, and
+ * the difference between them is the whole anchoring behaviour of an ordinary captioned message.
+ *
+ * A Bot's prose is never an anchor — the anchor exists to hold the QUESTION at the top while the
+ * answer streams in underneath it — and neither is a routine firing, which arrived wearing
+ * `role: "user"` without anybody having typed anything.
+ *
+ * Order is `toVisibleChatItems`' order, which puts a turn's attachments before its caption, so a
+ * turn carrying a file is anchored on the first file and a plain one on its text. That is the right
+ * end to hold: the picture is the top of what the person sent, and anchoring on the caption
+ * underneath it would scroll the picture off the top of the pane.
+ */
+function anchorRowIds(items: readonly TranscriptItem[]): Set<string> {
+  const anchors = new Set<string>();
+  const claimed = new Set<string>();
+
+  for (const item of items) {
+    const sent =
+      item.kind === "attachments" ||
+      (item.kind === "text" && isPersonSentMessage(item.role, item.text));
+    if (!sent) continue;
+
+    const turn = turnOf(item);
+    if (claimed.has(turn)) continue;
+    claimed.add(turn);
+    anchors.add(item.id);
+  }
+
+  return anchors;
+}
+
+/**
+ * The only way to actually enforce exhaustiveness over `VisibleChatItem`: the
+ * `item` parameter is typed `never`, so a branch that reaches here with a
+ * member of the union still unhandled fails to compile, rather than a
+ * trailing `: null` that accepts anything and renders nothing for it.
+ */
+function assertNever(_item: never): null {
+  return null;
+}
+
+const SEND_SCROLL_MS = 700;
+
+/**
+ * Whether the viewport should glide for a beat because the person just sent something.
+ *
+ * ONLY FOR A SEND MADE WHILE THE CONVERSATION IS OPEN. The newest person-sent id also changes while
+ * history is restored, batch by batch, and gliding then animated the scroller's jump to the bottom
+ * of a channel being opened: the conversation visibly loaded and then slid. The first id seen once
+ * history is in is the baseline, never a send.
+ *
+ * Exported so it can be checked without mounting anything.
+ */
+export function shouldGlideOnSend({
+  previous,
+  next,
+  restoring,
+  reducedMotion,
+}: {
+  previous: string | null;
+  next: string | null;
+  restoring: boolean;
+  reducedMotion: boolean;
+}): boolean {
+  return (
+    !restoring &&
+    !reducedMotion &&
+    previous !== null &&
+    next !== null &&
+    previous !== next
+  );
+}
+
+function useSmoothSendScroll(
+  viewport: React.RefObject<HTMLDivElement | null>,
+  newestUserMessageId: string | null,
+  restoring: boolean,
+  onSend: () => void,
+) {
+  const reducedMotion = useReducedMotion();
+  const seenRef = useRef<string | null>(null);
+  /*
+   * Whether the conversation has been seen open since it was restored. Separate from `seenRef`:
+   * the glide needs a previous message to compare with, but a send does not. In a routine's channel
+   * that holds only firings, the person's first message has nothing before it and is still a send.
+   */
+  const openRef = useRef(false);
+
+  useLayoutEffect(() => {
+    const element = viewport.current;
+    const previous = seenRef.current;
+    const wasOpen = openRef.current;
+    // Nothing is recorded while restoring, so the first id after it is a baseline (see above).
+    seenRef.current = restoring ? null : newestUserMessageId;
+    openRef.current = !restoring;
+
+    // A send picks following back up whatever the motion setting; only the glide depends on it.
+    if (
+      wasOpen &&
+      !restoring &&
+      newestUserMessageId !== null &&
+      newestUserMessageId !== previous
+    ) {
+      onSend();
+    }
+
+    if (
+      element === null ||
+      !shouldGlideOnSend({
+        previous,
+        next: newestUserMessageId,
+        restoring,
+        reducedMotion: reducedMotion ?? false,
+      })
+    ) {
+      return;
+    }
+
+    element.style.scrollBehavior = "smooth";
+    const timer = window.setTimeout(() => {
+      element.style.scrollBehavior = "";
+    }, SEND_SCROLL_MS);
+
+    return () => {
+      window.clearTimeout(timer);
+      element.style.scrollBehavior = "";
+    };
+  }, [newestUserMessageId, onSend, reducedMotion, restoring, viewport]);
+}
+
+/** The transcript's one `LateRenderersWatch`, with what it needs from the provider and the server. */
+function TranscriptRenderersWatch({
+  onVersion,
+}: {
+  onVersion: (version: number) => void;
+}) {
+  const { copilotkit } = useCopilotKit();
+  const { data: capabilities } = useQuery(deploymentCapabilitiesQueryOptions());
+  return (
+    <LateRenderersWatch
+      core={copilotkit}
+      onVersion={onVersion}
+      settled={capabilities?.generativeUi}
+    />
+  );
+}
+
+export function ChatTranscript({
+  threadId,
+  busy = false,
+  commandLabels = "",
+  intro,
+  messages,
+  onRemoveQueued,
+  onSendQueuedNow,
+  queued = EMPTY_QUEUE,
+  restoring = false,
+  stopped,
+  refusals = NO_REFUSALS,
+  onCarryOn,
+  working,
+}: ChatTranscriptProps) {
+  const isDrawn = useDrawnTool();
+  // Which calls draw a component, so one asked for too early is left out. See `shared/tool-steps.ts`.
+  const isComponent = useComponentTest();
+  /**
+   * The transcript's column, shared by the restoring state and the scroller. 768px, wider than the
+   * composer's 672px, which is the reading width ChatGPT and Claude.ai give an answer.
+   */
+  const column = "mx-auto w-full max-w-3xl px-4";
+  /*
+   * NOT MEMOISED, AND THAT IS DELIBERATE. `useMemo` keyed on `messages` looks obviously right and
+   * silently broke the transcript: the agent hands back the SAME array and mutates it, so the
+   * dependency never changed, the cached items were kept forever and a reply never appeared. A Bot
+   * that answered looked like a Bot that had not.
+   *
+   * It was never the expensive part either. Rebuilding this list is a flatMap over messages; the
+   * cost was markdown parsing and chart SVGs, and those are skipped by the memoised children below,
+   * which is where the 25x came from. This runs per render and is not worth guarding.
+   */
+  /* Which row each tool step was drawn in, so a row keeps its key; see `groupToolSteps`. */
+  const rowIdsRef = useRef(new Map<string, string>());
+  const visible = dropRepeatedAppCards(
+    toVisibleChatItems(messages, isComponent),
+  );
+  const items = groupToolSteps(visible, isDrawn, rowIdsRef.current);
+  /*
+   * In a task's thread, each turn's steps and the lines said on the way fold into one "Worked for"
+   * row (`foldTurnWork`). Worked out on every render, as `items` is.
+   */
+  const queryClient = useContext(QueryClientContext);
+  const taskThread = isTaskThread(threadId, items, queryClient);
+  // What waits on the person's approval stays out of the fold, its card with it.
+  const waiting = useWaitingToolCalls(queryClient);
+  const folds = taskThread ? foldTurnWork(items, busy, waiting) : NO_TURN_WORK;
+  // What the task read and made, for its Details pane beside the thread (`thread-work.ts`).
+  useEffect(() => {
+    if (taskThread && threadId)
+      publishThreadWork(threadId, threadWorkOf(visible));
+  });
+  const taskWork = {
+    folds,
+    lastAskId: [...folds.at.values()].at(-1)?.askId,
+  };
+  /*
+   * The folders this conversation's "Check your folders" steps named, for its other folder steps.
+   * The same map while the names are the same: a new one on every render is a new context value,
+   * and every finished tool row under it drew again while a reply streamed.
+   */
+  const foldersRef = useRef<{ key: string; names: FolderNames }>({
+    key: "",
+    names: new Map(),
+  });
+  const named = folderNamesIn(
+    visible.filter(
+      (item): item is Extract<typeof item, { kind: "tool" }> =>
+        item.kind === "tool",
+    ),
+  );
+  const namedKey = JSON.stringify([...named]);
+  if (namedKey !== foldersRef.current.key)
+    foldersRef.current = { key: namedKey, names: named };
+  const folders = foldersRef.current.names;
+
+  /*
+   * The people and channels this conversation's Slack steps named, so a reply that quotes Slack's
+   * `<@U…>` shows "@Alex Clarke". Kept the same map while the names are the same, as the folders are,
+   * so a finished message is not drawn again.
+   */
+  const slackRef = useRef<{ key: string; names: SlackNames }>({
+    key: "",
+    names: NO_SLACK_NAMES,
+  });
+  const slackNamed = slackNamesIn(
+    visible.filter(
+      (item): item is Extract<typeof item, { kind: "tool" }> =>
+        item.kind === "tool",
+    ),
+  );
+  const slackKey = JSON.stringify([...slackNamed]);
+  if (slackKey !== slackRef.current.key)
+    slackRef.current = { key: slackKey, names: slackNamed };
+  const slackNames = slackRef.current.names;
+
+  /*
+   * ONLY WHILE THERE IS NOTHING ELSE TO LOOK AT. Once a reply starts streaming, or a tool line
+   * appears, the transcript is already saying the Bot is working — a second indicator under a
+   * half-written answer would claim it had stopped and started again.
+   *
+   * So: the turn is in flight AND the last thing in the conversation is still the person's own
+   * message. A tool call that is running shimmers on its own line and needs nothing from here.
+   *
+   * OR the last thing is a tool row whose every call has its answer. The tools are done and the
+   * model is reading what they returned, which with five emails in hand can take a while, and a
+   * finished line does not shimmer. Seen on the Desktop: "Used Gmail" and its five steps sat still
+   * with nothing under them, and the person took the Bot for dead while it was still writing.
+   */
+  const lastItem = items.at(-1);
+  const toolsAllAnswered =
+    lastItem?.kind === "tools"
+      ? lastItem.steps.every((step) => step.result !== undefined)
+      : lastItem?.kind === "tool" && lastItem.result !== undefined;
+  const waitingOnTheModel =
+    busy &&
+    (toolsAllAnswered ||
+      (lastItem?.kind === "text" && lastItem.role === "user") ||
+      /*
+       * A screenshot pasted with no caption is still a person sending something, and they are
+       * watching the same spot under it for the Bot's answer as they would under a typed question.
+       * `toVisibleChatItems` only ever produces an `attachment` item from a user turn, so seeing one
+       * last means the person went last — without this an attachment-only turn silently swallowed
+       * the Thinking indicator.
+       */
+      lastItem?.kind === "attachments");
+
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const newestUserMessageId =
+    items.findLast(
+      (item) =>
+        (item.kind === "text" && isPersonSentMessage(item.role, item.text)) ||
+        /*
+         * Same reasoning as `waitingOnTheModel` above: an attachment is always the person's own,
+         * so a turn that is only a file still counts as them sending something. This id decides
+         * nothing but whether the viewport scrolls smoothly for a beat; where it lands is
+         * `anchoredTurns` below.
+         */
+        item.kind === "attachments",
+    )?.id ?? null;
+  /* Whether every turn is already in view, when the rail of turns has nowhere to take anybody. */
+  const allInView = useAllInView(viewportRef, restoring);
+  /* Whether the view follows a streaming reply; see `follow-intent`. */
+  const follow = useFollowIntent(viewportRef, restoring);
+  const { dispatch: dispatchFollow } = follow;
+  const followOnSend = useCallback(
+    () => dispatchFollow({ type: "send" }),
+    [dispatchFollow],
+  );
+  const followOnQueued = useCallback(
+    () => dispatchFollow({ type: "queued" }),
+    [dispatchFollow],
+  );
+  useSmoothSendScroll(
+    viewportRef,
+    newestUserMessageId,
+    restoring,
+    followOnSend,
+  );
+
+  /* Which tool calls are still the latest thing, for an app card: see `latestFrom`. */
+  const latestIndex = latestFrom(items, { busy, queued: queued.length });
+  /* Where the turn in flight starts: every row from here on is still running while the Bot works. */
+  const turnStart =
+    items.findLastIndex(
+      (item) =>
+        (item.kind === "text" && item.role === "user") ||
+        item.kind === "attachments",
+    ) + 1;
+  /* The last thing the Bot said, so a call can tell whether its turn went on to say anything: see `ToolPlace`. */
+  const lastBotWords = items.findLastIndex(
+    (item) => item.kind === "text" && item.role === "assistant",
+  );
+
+  /* One rule for both kinds of row — see `anchorRowIds`, which is where it is written down. */
+  const anchorRows = anchorRowIds(items);
+  /* The tasks' results drawn directly under their own card, which says which task each is about. */
+  const underTheirCards = reportsUnderTheirCards(items);
+
+  /*
+   * Decided once, from the rows present when the scroller mounts, and forgotten while restoring so
+   * a conversation opened again staggers again. Rows that arrive later are not in it: they have
+   * their own entrance (`Arriving`).
+   */
+  const openingRef = useRef<Map<string, string> | null>(null);
+  if (restoring) {
+    openingRef.current = null;
+  } else if (openingRef.current === null) {
+    openingRef.current = openingStagger(items.map((item) => item.id));
+  }
+  const opening = openingRef.current;
+  const openingProps = (id: string) => {
+    const delay = opening?.get(id);
+    return delay === undefined
+      ? {}
+      : {
+          className: "history-arrive",
+          style: { "--arrive-delay": delay } as React.CSSProperties,
+        };
+  };
+
+  /* Which rows are drawn; see `useTranscriptPages`. */
+  const pages = useTranscriptPages(
+    items.map((item) => item.id),
+    restoring,
+  );
+  const { drawEarlier, drawTo, from: pagesFrom } = pages;
+  const drawEarlierNearTop = useCallback(
+    (from: number) => {
+      const element = viewportRef.current;
+      if (
+        element !== null &&
+        shouldDrawEarlier({
+          from,
+          scrollTop: element.scrollTop,
+          scrollHeight: element.scrollHeight,
+        })
+      ) {
+        drawEarlier();
+      }
+    },
+    [drawEarlier],
+  );
+  /*
+   * After every page: a page that does not reach LOAD_MARGIN_PX above the fold (short rows, a tall
+   * screen) draws the one before it. ON THE NEXT FRAME, NOT IN THIS COMMIT. The scroller puts the
+   * reader back after a prepend from a MutationObserver callback, which runs after layout effects;
+   * checked here, a reader at the very top (where the browser has nothing to anchor against) still
+   * read `scrollTop` 0, drew another page, read 0 again, and drew the whole history in one burst,
+   * which past about fifty pages is more nested updates than React allows. A frame later the
+   * position is the restored one, and a page is only drawn if the reader really is still near the
+   * top. Each extra page lands above the fold and is held in place, so the wait is never seen.
+   */
+  useLayoutEffect(() => {
+    if (restoring) return;
+    const frame = window.requestAnimationFrame(() =>
+      drawEarlierNearTop(pagesFrom),
+    );
+    return () => window.cancelAnimationFrame(frame);
+  }, [pagesFrom, restoring, drawEarlierNearTop]);
+
+  /* Activities that may be waiting on their renderers; see `LateRenderersWatch`. */
+  const [renderersVersion, setRenderersVersion] = useState(0);
+  const hasActivities = items.some(
+    (item) =>
+      item.kind === "activity" &&
+      item.message.activityType !== VOICE_CHAT_ACTIVITY,
+  );
+
+  /* The rail's marks, and which turn is being read; see `TranscriptRail`. */
+  const turns = turnsOf(items);
+  const turnIds = turns.map((turn) => turn.id).join("\n");
+  const [activeTurn, setActiveTurn] = useState<string | null>(null);
+  /*
+   * Read at most once a frame, with one query: while a reply streams the scroller scrolls on every
+   * resize, and a lookup and a layout read per turn per scroll event was real work on a long
+   * conversation.
+   */
+  const activeFrameRef = useRef<number | null>(null);
+  const readActiveTurnNow = useCallback(() => {
+    activeFrameRef.current = null;
+    const element = viewportRef.current;
+    if (element === null || turnIds === "") return;
+    const wanted = new Set(turnIds.split("\n"));
+    const view = element.getBoundingClientRect();
+    const rows: { id: string; top: number }[] = [];
+    for (const row of element.querySelectorAll<HTMLElement>(
+      "[data-message-id]",
+    )) {
+      const id = row.dataset.messageId;
+      if (id !== undefined && wanted.has(id)) {
+        rows.push({ id, top: row.getBoundingClientRect().top - view.top });
+      }
+    }
+    setActiveTurn(
+      currentTurn(
+        rows,
+        element.clientHeight / 3,
+        element.scrollHeight - element.scrollTop - element.clientHeight <=
+          AT_END_PX,
+      ),
+    );
+  }, [turnIds]);
+  const readActiveTurn = useCallback(() => {
+    if (activeFrameRef.current !== null) return;
+    activeFrameRef.current = window.requestAnimationFrame(readActiveTurnNow);
+  }, [readActiveTurnNow]);
+  useEffect(
+    () => () => {
+      if (activeFrameRef.current !== null) {
+        window.cancelAnimationFrame(activeFrameRef.current);
+      }
+    },
+    [],
+  );
+  useLayoutEffect(() => {
+    if (!restoring) readActiveTurnNow();
+  }, [restoring, readActiveTurnNow]);
+
+  /*
+   * A jump from the rail. A turn already drawn is gone to now; one in a page not drawn yet draws
+   * every page down to it first, and is gone to a frame after that commit, once the scroller has put
+   * the reader back where they were (the same wait as the fill check above). Instant, never smooth:
+   * a smooth scroll up passes the top margin and draws pages above while it is moving, and the
+   * scroller's hold on the reader's place would fight it.
+   */
+  const jumpRef = useRef<string | null>(null);
+  const goToTurn = useCallback((id: string) => {
+    const element = viewportRef.current;
+    const row = element?.querySelector(`[data-message-id="${CSS.escape(id)}"]`);
+    if (!element || !row) return;
+    // Less the transcript's own top padding (`py-6`), so the turn sits where a first row would.
+    element.scrollTop +=
+      row.getBoundingClientRect().top -
+      element.getBoundingClientRect().top -
+      TURN_INSET_PX;
+  }, []);
+  /*
+   * Following stops as the view moves, not before the pages are drawn: the scroller holds the
+   * reader's place across a prepend by moving `scrollTop` down by what was added, and at the end of
+   * the conversation that reads exactly like the person scrolling back to the end, which picks
+   * following up again (`nextFollow`).
+   */
+  const goToTurnStill = useCallback(
+    (id: string) => {
+      goToTurn(id);
+      /*
+       * Not when the move left the view at the end: a short last turn is clamped there, nothing
+       * scrolls, and nothing would ever pick following up again.
+       */
+      const element = viewportRef.current;
+      if (
+        element !== null &&
+        element.scrollHeight - element.scrollTop - element.clientHeight >
+          RESUME_PX
+      ) {
+        dispatchFollow({ type: "jump" });
+      }
+    },
+    [dispatchFollow, goToTurn],
+  );
+  const jump = useCallback(
+    (turn: Turn) => {
+      setActiveTurn(turn.id);
+      if (turn.index < pagesFrom) {
+        jumpRef.current = turn.id;
+        drawTo(turn.index);
+      } else {
+        goToTurnStill(turn.id);
+      }
+    },
+    [drawTo, goToTurnStill, pagesFrom],
+  );
+  // biome-ignore lint/correctness/useExhaustiveDependencies: runs after the commit that drew the pages a jump asked for, which is a change of `pagesFrom`.
+  useLayoutEffect(() => {
+    const id = jumpRef.current;
+    if (id === null) return;
+    const frame = window.requestAnimationFrame(() => {
+      jumpRef.current = null;
+      goToTurnStill(id);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [pagesFrom, goToTurnStill]);
+
+  /*
+   * NOTHING BUT THE PLACEHOLDER UNTIL HISTORY IS COMPLETE, AND THE SCROLLER MOUNTED FRESH AFTER IT.
+   *
+   * History arrives in pieces: the gateway snapshot, then the stored thread merged into it, then
+   * the voice archive. Drawing each piece as it came showed a conversation that loaded and then
+   * moved. And the scroller decides where to land ONCE, in a layout effect, the first time it sees
+   * any child (`defaultScrollPosition`, applied by `ie()` in `@shadcn/react`'s message-scroller).
+   * Mounted early, it spent that on the always-present `contents` block below, and the restored
+   * rows then took the "rows appended" path, which pins a lone person's message to the top instead
+   * of going to the end. Mounted here, with every row in the same commit, its one landing is the
+   * bottom of the whole conversation, before the browser paints anything.
+   */
+  if (restoring) {
+    return (
+      <div className="flex size-full min-h-0 flex-col overflow-hidden">
+        <div
+          className={cn("flex flex-col gap-6 py-6", column)}
+          data-transcript-column
+        >
+          <RestoringTranscript />
+          {/*
+           * A message typed while history loads is parked, not lost, and must be seen to be: a
+           * composer that cleared with nothing appearing reads as a message that vanished, and the
+           * person types it again.
+           */}
+          {queued.map((message) => (
+            <Queued
+              attachments={message.attachments}
+              key={message.id}
+              next={message.next === true}
+              onRemove={
+                onRemoveQueued ? () => onRemoveQueued(message.id) : undefined
+              }
+              onSendNow={
+                onSendQueuedNow ? () => onSendQueuedNow(message.id) : undefined
+              }
+              text={message.text}
+            />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  /*
+   * One row, wherever it is drawn. `index` is the row's place in `items`, not in the slice being
+   * drawn, so "the last row" and "latest" mean the same with or without older pages above.
+   */
+  /*
+   * What one row draws, without the scroller's wrapper: drawn on its own below, and inside a task
+   * turn's "Worked for" row when it folds there (`foldTurnWork`).
+   */
+  /*
+   * Each refused message's notice goes under its last row (its words, or its attachments when it
+   * has no words), by row id. A refusal whose message isn't drawn here draws nothing.
+   */
+  const refusedUnder = new Map<string, string>();
+  if (refusals.size > 0) {
+    const lastRow = new Map<string, string>();
+    for (const item of items)
+      if (item.kind === "text" || item.kind === "attachments")
+        lastRow.set(personMessageOf(item.id), item.id);
+    for (const [messageId, sentence] of refusals) {
+      const row = lastRow.get(messageId);
+      if (row !== undefined) refusedUnder.set(row, sentence);
+    }
+  }
+
+  const rowContent = (item: TranscriptItem, index: number) =>
+    item.kind === "tools" || item.kind === "tool" ? (
+      <ToolRow
+        active={busy && index === items.length - 1}
+        id={item.id}
+        inFlight={busy && index >= turnStart}
+        latest={index >= latestIndex}
+        spokeAfter={lastBotWords > index}
+        steps={item.kind === "tools" ? item.steps : [item]}
+      />
+    ) : item.kind === "activity" ? (
+      <TranscriptActivity message={item.message} />
+    ) : item.kind === "text" ? (
+      <TranscriptMessage
+        threadId={threadId}
+        messageId={item.id}
+        settled={!busy || index < turnStart}
+        commandLabels={commandLabels}
+        role={item.role}
+        slackNames={slackNames}
+        underItsCard={underTheirCards.has(item.id)}
+        refused={refusedUnder.has(item.id)}
+        streaming={
+          busy && item.role === "assistant" && index === items.length - 1
+        }
+        text={item.text}
+      />
+    ) : item.kind === "attachments" ? (
+      <TranscriptAttachments attachments={item.attachments} />
+    ) : (
+      // Every member of the union is handled above. `assertNever` types `item` as
+      // `never` here, so a future addition to `VisibleChatItem` fails to typecheck at
+      // this call instead of silently falling into this branch and rendering nothing.
+      assertNever(item)
+    );
+
+  /*
+   * One row, wherever it is drawn. `index` is the row's place in `items`, not in the slice being
+   * drawn, so "the last row" and "latest" mean the same with or without older pages above. In a
+   * task's thread a turn's work is one row, drawn where its first step is; the rest of it is drawn
+   * inside that row.
+   */
+  const renderRow = (item: TranscriptItem, index: number) => {
+    const work = taskWork.folds.at.get(item.id);
+    if (work)
+      return (
+        <MessageScrollerItem
+          key={work.id}
+          messageId={work.id}
+          {...openingProps(item.id)}
+        >
+          <WorkedFor
+            last={work.askId === taskWork.lastAskId}
+            threadId={threadId}
+            work={work}
+          >
+            {work.rows.map((row) => (
+              <Fragment key={row.item.id}>
+                {rowContent(row.item, row.index)}
+              </Fragment>
+            ))}
+          </WorkedFor>
+        </MessageScrollerItem>
+      );
+    if (taskWork.folds.inside.has(item.id)) return null;
+    // A refused turn's notice, under the last row of the person's message it answered.
+    const refusal = refusedUnder.get(item.id);
+    return (
+      <MessageScrollerItem
+        key={item.id}
+        messageId={item.id}
+        scrollAnchor={
+          item.kind === "text" || item.kind === "attachments"
+            ? anchorRows.has(item.id)
+            : undefined
+        }
+        {...openingProps(item.id)}
+      >
+        {rowContent(item, index)}
+        {/*
+         * Inside the message's own row, not a row of its own: the scroller counts its rows by
+         * position, and a row added beside a message would read as a new one arriving. The gap is
+         * the column's own (`gap-6`), so it sits as the live notice does.
+         */}
+        {refusal !== undefined ? (
+          <div className="mt-6">
+            <Stopped reason={refusal} />
+          </div>
+        ) : null}
+      </MessageScrollerItem>
+    );
+  };
+
+  return (
+    <ArrivalsLive>
+      {hasActivities ? (
+        <TranscriptRenderersWatch onVersion={setRenderersVersion} />
+      ) : null}
+      <FolderNamesContext.Provider value={folders}>
+        <LateRenderersContext.Provider value={renderersVersion}>
+          <MessageScrollerProvider
+            autoScroll={follow.following}
+            scrollPreviousItemPeek={48}
+          >
+            <MessageScroller className="@container">
+              <MessageScrollerViewport
+                {...follow.viewportHandlers}
+                data-following={follow.following}
+                onScroll={(event) => {
+                  follow.viewportHandlers.onScroll?.(event);
+                  drawEarlierNearTop(pagesFrom);
+                  readActiveTurn();
+                }}
+                ref={viewportRef}
+              >
+                <MessageScrollerContent
+                  aria-busy={busy}
+                  className={cn("py-6", column)}
+                  data-transcript-column
+                  spacerClassName="order-2"
+                >
+                  {/*
+                   * THE INTRO IS THE FIRST CHILD, AND ONLY ONCE THE EARLIEST PAGE IS DRAWN. The scroller
+                   * reads "the first child moved" as rows prepended and holds the reader's place (see the
+                   * block below). Drawn while older pages are still to come, the intro would stay the
+                   * first child and every page drawn under it would be read as appended rows instead.
+                   * Drawn in the same commit as the earliest page, it is the prepend.
+                   */}
+                  {pages.from === 0 ? intro : null}
+                  {/*
+                   * DRAWN LAST, WRITTEN FIRST, AND THE SCROLLER IS WHY. Three reviewers have now arrived
+                   * at this block, worked the mechanism out from the library's bundle, and reached the
+                   * same place; it had no comment for any of them to read. This is that comment.
+                   *
+                   * `MessageScrollerContent` is `flex flex-col`, so `order` is live: the spacer takes
+                   * `order-2`, these children take `order-1`, and the transcript rows below keep the
+                   * default `0`. Visual order is therefore items, then anything parked or in flight, then
+                   * the spacer — while DOM order puts this block first.
+                   *
+                   * IT CANNOT SIMPLY BE MOVED DOWN. The scroller finds a newly appended row POSITIONALLY.
+                   * On every content change it takes `Array.from(content.children)` minus the spacer,
+                   * compares the length against the previous length, and when it grew scans FROM THE OLD
+                   * LENGTH FORWARD for the next `data-scroll-anchor="true"` (`je(a, T)` in
+                   * `@shadcn/react/dist/message-scroller`). A new row is only found when it lands at the
+                   * very end of that list. Put this block after `items.map` and every appended row lands
+                   * one slot short of the end, the scan finds this div instead, returns null, and the
+                   * caller falls through to its follow-the-bottom branch — so a new turn stops aligning
+                   * to the top of the viewport with a peek of the previous one, silently, with no test
+                   * failing.
+                   *
+                   * OLDER PAGES GO BEFORE THIS BLOCK, AND THAT IS THE SAME MECHANISM USED ON PURPOSE.
+                   * When the reader nears the top, the page before is drawn (`useTranscriptPages`). Drawn
+                   * here, ahead of this block, it moves whatever was the first child, and a first child
+                   * that moved is the scroller's own "rows were prepended" case: it puts the row the
+                   * reader was looking at back where it was (`de()`), and never runs the scan above, which
+                   * would read the shifted rows as new ones and jump to an old turn. Rows that arrive
+                   * live still go after this block, at the end, where that scan looks for them.
+                   *
+                   * ONE CASE IT DOES NOT COVER. The scroller takes one path per batch of changes, so a page
+                   * drawn above and a sent message landing in the SAME commit would be held in place and
+                   * the new turn not aligned to the top. They come from different updates (a scroll near
+                   * the top, a send at the bottom) and in practice never commit together; if they ever
+                   * do, the turn is not aligned when it arrives, and a later change that keeps the row
+                   * count can align to it then instead (the scroller's `Ge`), a beat late.
+                   *
+                   * `display: contents` IS LOAD-BEARING FOR THE SAME REASON, and not a layout trick. It
+                   * promotes these children to flex items of the column so they can carry `order`, while
+                   * the div itself stays a single, always-present entry in `content.children` — one
+                   * stable slot the row count can be offset by. Wrapping `items.map` the same way would
+                   * be the natural symmetry and is fatal: the rows would leave `content.children`
+                   * entirely and the scroller would see a transcript of two elements, neither carrying a
+                   * `data-message-id`, so nothing would register, be tracked as visible, or anchor.
+                   *
+                   * WHAT THIS COSTS, STATED RATHER THAN LEFT TO BE REDISCOVERED. `order` moves paint and
+                   * not the DOM, so it moves neither focus order nor the reading order of the enclosing
+                   * `role="log"`. A keyboard user tabbing in reaches the "Remove queued message: …"
+                   * button of every parked message before any control in the conversation, though those
+                   * lines are drawn at the very bottom (WCAG 2.4.3); a screen reader reading the log
+                   * linearly hears the parked messages, and `Stopped`, ahead of the conversation they
+                   * follow on screen (WCAG 1.3.2).
+                   *
+                   * THAT IS A KNOWN, UNPAID DEBT AND NOT AN OVERSIGHT. The fixes available from inside
+                   * this file were each tried on paper and each breaks something worse: `aria-owns` needs
+                   * a generated id per row and re-sequences only the accessibility tree, leaving tab
+                   * order inverted; positive `tabIndex` hijacks the tab sequence of the whole page;
+                   * hoisting the queue out of `MessageScrollerContent` into a sibling region — the
+                   * cleanest END STATE, since a parked message is genuinely not a log entry — puts it
+                   * outside a column that is `min-h-full`, so it lands below the fold on a short
+                   * transcript, outside the `gap-6` rhythm, and outside the spacer's height arithmetic.
+                   * Paying it properly means the scroller identifying new rows by identity rather than by
+                   * position, which is the library's to change and is worth asking for.
+                   */}
+                  <ArrivalsLiveContext.Provider value={AT_REST}>
+                    {items
+                      .slice(pages.from, pages.split)
+                      .map((item, offset) =>
+                        renderRow(item, pages.from + offset),
+                      )}
+                  </ArrivalsLiveContext.Provider>
+                  <div className="contents [&>*]:order-1">
+                    {stopped ? (
+                      <Stopped onCarryOn={onCarryOn} reason={stopped} />
+                    ) : waitingOnTheModel ? (
+                      <Thinking />
+                    ) : null}
+                    {working}
+                    {queued.map((message) => (
+                      <Queued
+                        attachments={message.attachments}
+                        key={message.id}
+                        next={message.next === true}
+                        onRemove={
+                          onRemoveQueued
+                            ? () => onRemoveQueued(message.id)
+                            : undefined
+                        }
+                        onSendNow={
+                          onSendQueuedNow
+                            ? () => onSendQueuedNow(message.id)
+                            : undefined
+                        }
+                        text={message.text}
+                      />
+                    ))}
+                  </div>
+                  {items
+                    .slice(pages.split)
+                    .map((item, offset) =>
+                      renderRow(item, pages.split + offset),
+                    )}
+                </MessageScrollerContent>
+              </MessageScrollerViewport>
+              <MessageScrollerButton
+                onClick={(event) => {
+                  // Ours, not the scroller's: it would scroll before it had been told to follow again.
+                  event.preventDefault();
+                  dispatchFollow({ type: "button" });
+                }}
+              />
+              <ScrollNewestQueuedIntoView
+                newest={queued.at(-1)?.id ?? null}
+                onQueued={followOnQueued}
+              />
+              <FollowScroll request={follow.request} />
+              {/*
+               * Not while every turn is in view: beside two short turns its marks read as a stray
+               * dash in the margin, and choosing one moved nothing.
+               */}
+              {allInView ? null : (
+                <TranscriptRail
+                  active={activeTurn}
+                  onJump={jump}
+                  turns={turns}
+                />
+              )}
+            </MessageScroller>
+          </MessageScrollerProvider>
+        </LateRenderersContext.Provider>
+      </FolderNamesContext.Provider>
+    </ArrivalsLive>
+  );
+}

@@ -1,0 +1,129 @@
+import { CopilotKitProvider } from "@copilotkit/react-core/v2";
+import {
+  deviceTimeZone,
+  PERSON_TIME_ZONE_PROP,
+} from "@openbot/shared/person-time-zone";
+import { useQuery } from "@tanstack/react-query";
+import { type ReactNode, useMemo } from "react";
+import { withClientName } from "@/lib/client";
+import { deploymentCapabilitiesQueryOptions } from "@/lib/deployment/queries";
+import {
+  organizationHeaders,
+  useCurrentOrganizationId,
+} from "@/lib/organizations/current";
+import { generativeUiProviderOptions } from "./a2ui";
+import { ActiveBotProvider } from "./active-bot";
+import { BotOffers } from "./bot-offer";
+import { BotTools } from "./bot-tools";
+import { CheckInOfferTool } from "./check-in-offer-tool";
+import { CodingTools } from "./coding-tools";
+import { ComputerTools } from "./computer-tools";
+import { EscalationTool } from "./escalation-tool";
+import { GalleryTools } from "./gallery-tools";
+import { GENERATIVE_UI_DESIGN_SKILL } from "./generative-ui";
+import { HandoffTool } from "./handoff-tool";
+import { OrchestrationTools } from "./orchestration-tools";
+import { SandboxedTools } from "./sandboxed-tools";
+import { SignInTool } from "./sign-in-tool";
+import { SkillTools } from "./skill-tools";
+
+/**
+ * The CopilotKit client, wrapped once for the whole authenticated app.
+ *
+ * `credentials: "include"` is the load-bearing part. OpenBot authenticates with a Better Auth
+ * session cookie, and the runtime endpoint sits behind the same guard as every other API route, so
+ * without it every run is rejected as anonymous while the rest of the app looks signed in.
+ *
+ * The URL is relative, like every other call in the app, so the Vite dev proxy and a single-origin
+ * deployment both work without a build-time base URL to get wrong.
+ *
+ * There is no `publicApiKey`. The Intelligence key and licence token are deployment secrets held by
+ * the server; a browser never sees them (the API's `deployment`, which the app reads what it may do
+ * from, is a projection of the runtime rather than the runtime itself).
+ */
+export function CopilotProvider({ children }: { children: ReactNode }) {
+  const { data: capabilities } = useQuery(deploymentCapabilitiesQueryOptions());
+  const properties = useMemo(() => runProperties(deviceTimeZone()), []);
+  /*
+   * Every runtime request names the organization this tab is working in. The session works in one
+   * organization for every tab, so a tab left in one after a switch in another wrote its message
+   * where it said and ran the Bot where the session said, which had no such Bot. The server runs
+   * it in the one named, when the person is a member of it.
+   */
+  const organization = useCurrentOrganizationId();
+  // And this app, as every request to OpenBot names it (lib/client.ts).
+  const headers = useMemo(
+    () => withClientName(organizationHeaders(organization)),
+    [organization],
+  );
+
+  return (
+    <CopilotKitProvider
+      enableInspector={false}
+      runtimeUrl="/api/copilotkit"
+      credentials="include"
+      headers={headers}
+      properties={properties}
+      {...generativeUiProviderOptions(capabilities?.generativeUi)}
+      /*
+       * Passed only when this deployment actually has the capability, and this is the load-bearing
+       * part rather than a tidiness. The SDK reads generative UI as on when EITHER the runtime says
+       * so OR this prop is present at all, so passing it unconditionally would switch the browser
+       * half on in a deployment that had switched the server half off. The Bot would then be offered
+       * the tool, generate a whole interface, and nothing would draw it, because the events that
+       * paint one come from the runtime middleware this deployment declined to run.
+       *
+       * Absent, the SDK asks the runtime and believes the answer, which is the behaviour we want
+       * while this query is still in flight.
+       *
+       * The object carries guidance only. It does not turn anything on that the server has not
+       * already turned on; it replaces the SDK's shadcn-flavoured house style with OpenBot's.
+       */
+      {...(capabilities?.generativeUi
+        ? { openGenerativeUI: { designSkill: GENERATIVE_UI_DESIGN_SKILL } }
+        : {})}
+    >
+      {/* Computer tools act on the Bot that made the call, which is usually the one on screen. */}
+      <ActiveBotProvider>
+        {/* Each run is offered its own Bot's tools, never the screen's; see bot-offer.ts. */}
+        <BotOffers />
+        <ComputerTools />
+        {/* The private sign-in request: a card whose form posts to the server, never to the Bot. */}
+        <SignInTool />
+        {/*
+          Draws a Bot bringing in another Bot. Registers no tool: `message_bot` runs on the server,
+          where the grant and the caps are. A hop that happens off-screen is the thing to avoid.
+        */}
+        <HandoffTool />
+        <EscalationTool />
+        {/* A Bot handing work into a task thread, reacting, or giving a thread's link. Server-run. */}
+        <OrchestrationTools />
+        {/* A Bot offering a check-in on what the two of them just looked at. Runs on the server. */}
+        <CheckInOfferTool />
+        {/* A coding harness Bot's own tools, which it runs itself: commands, diffs and its plan. */}
+        <CodingTools />
+        {/* Gallery tools are registered once; their handlers ask about the Bot that made the call (see botOfCall). */}
+        <GalleryTools />
+        {/* Browser-authored components use the same component grants as the compiled gallery. */}
+        <SandboxedTools />
+        {/* Offered only on a Bot holding the skill-creator skill; see skill-tools.tsx. */}
+        <SkillTools />
+        {/*
+          Making a coworker from a conversation. Registers nothing unless the declared Bot holds the
+          `bot-creator` skill, so most runs are not offered these four tools at all.
+        */}
+        <BotTools />
+        {children}
+      </ActiveBotProvider>
+    </CopilotKitProvider>
+  );
+}
+
+/**
+ * What every run this browser starts carries for the server, as its `forwardedProps`: the person's
+ * IANA time zone, so a Bot's "today" and "9am" are theirs and not UTC. Nothing when the device cannot
+ * say, and the server then gives the date in UTC. See `person-time-zone.ts`.
+ */
+function runProperties(timeZone: string | undefined): Record<string, unknown> {
+  return timeZone ? { [PERSON_TIME_ZONE_PROP]: timeZone } : {};
+}

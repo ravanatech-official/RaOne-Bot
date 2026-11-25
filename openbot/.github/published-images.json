@@ -1,0 +1,16 @@
+[
+  "agent-crewai",
+  "agent-llamaindex",
+  "agent-agno",
+  "agent-langgraph-agui",
+  "agent-langgraph-ts",
+  "agent-adk",
+  "agent-pydantic-ai",
+  "agent-microsoft",
+  "agent-claude-sdk",
+  "agent-strands",
+  "agent-ag2",
+  "agent-langroid",
+  "agent-mastra",
+  "agent-antigravity"
+]
