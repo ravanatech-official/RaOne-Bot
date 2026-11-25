@@ -1,0 +1,30 @@
+name: Import OpenBot archive
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/import-openbot.yml']
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add the verified source to main
+        run: |
+          set -euo pipefail
+          commit=447c1183e6476c94190e3c0dcd731b3600b828b2
+          tree=7c81ceb5f3f7fa1d830d311cad58f8caa78cf9ff
+          if git cat-file -e HEAD:openbot 2>/dev/null; then
+            test "$(git rev-parse HEAD:openbot)" = "$tree"
+            exit 0
+          fi
+          git fetch --depth=1 --no-tags https://github.com/CopilotKit/OpenBot.git "$commit"
+          test "$(git rev-parse 'FETCH_HEAD^{tree}')" = "$tree"
+          git read-tree --prefix=openbot/ "$tree"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Import all 5496 OpenBot source files from verified ZIP'
+          test "$(git rev-parse HEAD:openbot)" = "$tree"
+          git push origin HEAD:refs/heads/main
